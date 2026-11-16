@@ -8,9 +8,13 @@ use russh::{
         load_secret_key, known_hosts, HashAlg, PrivateKeyWithHashAlg, PublicKey,
         PublicKeyOrCertificate,
     },
-    ChannelMsg, ChannelWriteHalf,
+    Channel, ChannelMsg, ChannelOpenFailure, ChannelWriteHalf,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, oneshot, Mutex},
+    task::JoinHandle,
+};
 
 #[derive(Debug, Clone)]
 pub enum AuthMethod {
@@ -102,6 +106,8 @@ struct ClientHandler {
     port: u16,
     known_hosts_path: Option<PathBuf>,
     prompt_tx: Option<HostKeyPromptTx>,
+    /// Channels the server opens for remote (-R) forwards.
+    forwarded_tx: mpsc::UnboundedSender<(Channel<client::Msg>, u32)>,
 }
 
 /// Remove every stored host-key line matching `host`/`[host]:port`.
@@ -198,13 +204,61 @@ impl Handler for ClientHandler {
         }
         Ok(true)
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if self.forwarded_tx.send((channel, connected_port)).is_ok() {
+            reply.accept().await;
+        } else {
+            reply.reject(ChannelOpenFailure::ConnectFailed).await;
+        }
+        Ok(())
+    }
 }
 
 /// One live SSH session: a PTY channel plus a background task pumping
 /// server output into `SessionEvent`s.
+/// A running local (-L) or remote (-R) forward. Drop `task` to stop it.
+pub struct Forward {
+    /// Port actually bound (relevant when 0 was requested).
+    pub bound_port: u16,
+    pub task: JoinHandle<()>,
+}
+
+/// Route table + demux task for remote (-R) forwards on one session.
+pub struct RemoteForwarder {
+    routes: Arc<Mutex<std::collections::HashMap<u32, (String, u16)>>>,
+    _demux: JoinHandle<()>,
+}
+
+impl RemoteForwarder {
+    /// Register `remote_port -> target` so newly accepted channels are
+    /// bridged there.
+    pub async fn add_route(&self, remote_port: u32, target_host: String, target_port: u16) {
+        self.routes
+            .lock()
+            .await
+            .insert(remote_port, (target_host, target_port));
+    }
+
+    pub async fn remove_route(&self, remote_port: u32) {
+        self.routes.lock().await.remove(&remote_port);
+    }
+}
+
 pub struct SshSession {
     write_half: ChannelWriteHalf<client::Msg>,
     handle: Handle<ClientHandler>,
+    /// Taken by `start_remote_forwarder` (one per session).
+    forwarded_rx: Mutex<Option<mpsc::UnboundedReceiver<(Channel<client::Msg>, u32)>>>,
 }
 
 impl SshSession {
@@ -221,11 +275,13 @@ impl SshSession {
         } else {
             params.connect_timeout
         };
+        let (forwarded_tx, forwarded_rx) = mpsc::unbounded_channel();
         let handler = ClientHandler {
             host: params.host.clone(),
             port: params.port,
             known_hosts_path: params.known_hosts_path.clone(),
             prompt_tx: params.hostkey_prompt_tx.clone(),
+            forwarded_tx,
         };
         let mut handle = tokio::time::timeout(
             connect_timeout,
@@ -292,7 +348,116 @@ impl SshSession {
         Ok(Self {
             write_half,
             handle,
+            forwarded_rx: Mutex::new(Some(forwarded_rx)),
         })
+    }
+
+    /// Start a local (-L) forward: listen on `listen_addr:listen_port` and
+    /// pipe every connection to `target_host:target_port` through a
+    /// direct-tcpip channel. Returns the bound port and the accept task.
+    pub async fn start_local_forward(
+        self: &Arc<Self>,
+        listen_host: String,
+        listen_port: u16,
+        target_host: String,
+        target_port: u16,
+    ) -> anyhow::Result<Forward> {
+        let listener = TcpListener::bind((listen_host.as_str(), listen_port))
+            .await
+            .with_context(|| format!("bind {listen_host}:{listen_port}"))?;
+        let bound_port = listener.local_addr()?.port();
+        let session = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut tcp, peer)) => {
+                        let (th, tp) = (target_host.clone(), target_port);
+                        let sess = Arc::clone(&session);
+                        tokio::spawn(async move {
+                            let dest = format!("{th}:{tp}");
+                            match sess
+                                .handle
+                                .channel_open_direct_tcpip(
+                                    th,
+                                    tp as u32,
+                                    peer.ip().to_string(),
+                                    peer.port() as u32,
+                                )
+                                .await
+                            {
+                                Ok(channel) => {
+                                    let mut stream = channel.into_stream();
+                                    let _ = tokio::io::copy_bidirectional(
+                                        &mut tcp, &mut stream,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("direct-tcpip to {dest} failed: {e}");
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("forward accept failed: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Forward { bound_port, task })
+    }
+
+    /// Create the per-session demux for remote (-R) forwards. Only the
+    /// first call succeeds.
+    pub async fn start_remote_forwarder(self: &Arc<Self>) -> anyhow::Result<RemoteForwarder> {
+        let rx = self
+            .forwarded_rx
+            .lock()
+            .await
+            .take()
+            .context("remote forwarder already started")?;
+        let routes: Arc<Mutex<std::collections::HashMap<u32, (String, u16)>>> =
+            Default::default();
+        let routes2 = Arc::clone(&routes);
+        let demux = tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some((channel, port)) = rx.recv().await {
+                let route = routes2.lock().await.get(&port).cloned();
+                let Some((th, tp)) = route else {
+                    tracing::warn!("no -R route for remote port {port}");
+                    continue;
+                };
+                tokio::spawn(async move {
+                    match TcpStream::connect((th.as_str(), tp)).await {
+                        Ok(mut tcp) => {
+                            let mut stream = channel.into_stream();
+                            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+                        }
+                        Err(e) => tracing::warn!("-R connect to {th}:{tp} failed: {e}"),
+                    }
+                });
+            }
+        });
+        Ok(RemoteForwarder { routes, _demux: demux })
+    }
+
+    /// Ask the server to listen on `addr:port` (remote -R side).
+    pub async fn request_remote_forward(&self, addr: &str, port: u16) -> anyhow::Result<u16> {
+        let bound = self
+            .handle
+            .tcpip_forward(addr.to_string(), port as u32)
+            .await
+            .context("tcpip_forward denied")?;
+        Ok(if port == 0 { bound as u16 } else { port })
+    }
+
+    pub async fn cancel_remote_forward(&self, addr: &str, port: u16) -> anyhow::Result<()> {
+        self.handle
+            .cancel_tcpip_forward(addr.to_string(), port as u32)
+            .await
+            .context("cancel_tcpip_forward")?;
+        Ok(())
     }
 
     pub async fn write(&self, data: &[u8]) -> anyhow::Result<()> {

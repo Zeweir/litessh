@@ -10,6 +10,7 @@
 - PTY 交互 shell、窗口大小自适应、Ctrl+Shift+C/V 复制粘贴
 - known_hosts 主机密钥校验（TOFU）：首次连接弹窗确认 SHA256 指纹，密钥变更时强警告；记录存于应用配置目录 `known_hosts`（OpenSSH 格式）
 - SFTP 文件面板（标签页 ⇄ 按钮）：远程目录浏览、上传/下载、新建目录、删除
+- 端口转发面板（标签页 ⇒ 按钮）：本地 -L 转发与远程 -R 转发，随会话断开自动清理
 
 ## 结构
 
@@ -32,6 +33,8 @@ npm run tauri dev        # 前端 vite dev + 桌面窗口
 ```bash
 cargo build -p ssh-cli
 ./target/debug/ssh-cli --host 127.0.0.1 --port 22 --user me --key ~/.ssh/id_ed25519
+
+# 可选参数：--sftp-ls <dir> 列目录 | --fwd-l lport:host:tport | --fwd-r rport:host:tport
 ```
 
 ## Windows 打包
@@ -45,7 +48,8 @@ CI 已配置（`.github/workflows/build.yml`）：Windows runner 上自动构建
 ## 路线图
 
 - [x] SFTP 文件浏览/上传/下载
-- [ ] 本地/远程/动态端口转发
+- [x] 本地 -L / 远程 -R 端口转发
+- [ ] 动态转发（SOCKS5）
 - [x] known_hosts 主机密钥校验（TOFU）
 - [ ] 读取 `~/.ssh/config`、命令片段库
 - [ ] Windows 凭据管理器存密码

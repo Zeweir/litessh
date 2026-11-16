@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
@@ -33,6 +33,23 @@ struct Args {
     /// After connecting, list this remote directory over SFTP and exit.
     #[arg(long)]
     sftp_ls: Option<String>,
+    /// Local forward spec `listen_port:target_host:target_port`; binds
+    /// 127.0.0.1 and prints the bound port, then keeps running until
+    /// timeout. Repeatable.
+    #[arg(long = "fwd-l")]
+    fwd_local: Vec<String>,
+    /// Remote forward spec `remote_port:target_host:target_port`.
+    /// Repeatable.
+    #[arg(long = "fwd-r")]
+    fwd_remote: Vec<String>,
+}
+
+fn parse_fwd(spec: &str) -> Result<(u16, String, u16)> {
+    let parts: Vec<&str> = spec.rsplitn(3, ':').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("bad forward spec {spec:?}, want listen:host:port");
+    }
+    Ok((parts[2].parse()?, parts[1].to_string(), parts[0].parse()?))
 }
 
 #[tokio::main]
@@ -88,7 +105,7 @@ async fn main() -> Result<()> {
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let session = SshSession::connect(&params, tx).await?;
+    let session = Arc::new(SshSession::connect(&params, tx).await?);
     eprintln!("[connected]");
 
     if let Some(dir) = args.sftp_ls {
@@ -104,6 +121,23 @@ async fn main() -> Result<()> {
         }
         session.disconnect().await.ok();
         return Ok(());
+    }
+
+    for spec in &args.fwd_local {
+        let (lp, th, tp) = parse_fwd(spec)?;
+        let f = session
+            .start_local_forward("127.0.0.1".into(), lp, th, tp)
+            .await?;
+        eprintln!("[fwd-l] 127.0.0.1:{} ready", f.bound_port);
+    }
+    if !args.fwd_remote.is_empty() {
+        let forwarder = session.start_remote_forwarder().await?;
+        for spec in &args.fwd_remote {
+            let (rp, th, tp) = parse_fwd(spec)?;
+            let bound = session.request_remote_forward("127.0.0.1", rp).await?;
+            forwarder.add_route(bound as u32, th, tp).await;
+            eprintln!("[fwd-r] remote 127.0.0.1:{bound} ready");
+        }
     }
 
     session.write(args.cmd.as_bytes()).await?;

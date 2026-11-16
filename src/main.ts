@@ -27,6 +27,7 @@ interface SessionTab {
   dead: boolean;
   sftpPanel?: HTMLDivElement;
   sftpPath?: string;
+  fwdPanel?: HTMLDivElement;
 }
 
 interface SftpEntry {
@@ -234,10 +235,14 @@ function createTab(title: string): SessionTab {
   sftpBtn.className = "close";
   sftpBtn.title = "SFTP file browser";
   sftpBtn.textContent = "⇄";
+  const fwdBtn = document.createElement("button");
+  fwdBtn.className = "close";
+  fwdBtn.title = "Port forwarding (tunnels)";
+  fwdBtn.textContent = "⇒";
   const closeBtn = document.createElement("button");
   closeBtn.className = "close";
   closeBtn.textContent = "✕";
-  tabEl.append(dot, label, sftpBtn, closeBtn);
+  tabEl.append(dot, label, sftpBtn, fwdBtn, closeBtn);
   $("#tab-bar").appendChild(tabEl);
 
   const tab: SessionTab = {
@@ -284,6 +289,9 @@ function createTab(title: string): SessionTab {
     else if ((e.target as HTMLElement) === sftpBtn) {
       activateTab(tab);
       void toggleSftp(tab);
+    } else if ((e.target as HTMLElement) === fwdBtn) {
+      activateTab(tab);
+      void toggleFwd(tab);
     } else activateTab(tab);
   });
   tabEl.addEventListener("auxclick", (e) => {
@@ -525,6 +533,112 @@ async function sftpRemove(tab: SessionTab, entry: SftpEntry) {
     await sftpList(tab, tab.sftpPath ?? "/");
   } catch (e) {
     sftpStatus(tab, String(e), true);
+  }
+}
+
+// --- port forwarding panel ---
+
+interface ForwardInfo {
+  id: string;
+  kind: "local" | "remote";
+  listenHost: string;
+  listenPort: number;
+  targetHost: string;
+  targetPort: number;
+}
+
+function fwdStatus(tab: SessionTab, msg: string, isErr = false) {
+  const el = tab.fwdPanel?.querySelector(".sftp-status");
+  if (el) {
+    el.textContent = msg;
+    el.classList.toggle("err", isErr);
+  }
+}
+
+function toggleFwd(tab: SessionTab) {
+  if (!tab.sessionId) return;
+  if (!tab.fwdPanel) {
+    const panel = document.createElement("div");
+    panel.className = "sftp-panel fwd-panel";
+    panel.innerHTML = `
+      <div class="fwd-form">
+        <select class="fwd-kind" title="Forward type">
+          <option value="local">-L local</option>
+          <option value="remote">-R remote</option>
+        </select>
+        <input class="fwd-lhost" value="127.0.0.1" placeholder="listen host" />
+        <input class="fwd-lport" placeholder="listen port" inputmode="numeric" />
+        <span class="fwd-arrow">→</span>
+        <input class="fwd-thost" placeholder="target host" />
+        <input class="fwd-tport" placeholder="target port" inputmode="numeric" />
+        <button data-act="add" title="Add forward">+</button>
+      </div>
+      <div class="sftp-list fwd-list"></div>
+      <div class="sftp-status"></div>`;
+    panel.querySelector<HTMLButtonElement>('[data-act="add"]')!.onclick = () =>
+      void fwdAdd(tab);
+    tab.el.appendChild(panel);
+    tab.fwdPanel = panel;
+    void fwdList(tab);
+  }
+  tab.fwdPanel.classList.toggle("open");
+}
+
+async function fwdAdd(tab: SessionTab) {
+  const p = tab.fwdPanel;
+  if (!p) return;
+  const kind = p.querySelector<HTMLSelectElement>(".fwd-kind")!.value;
+  const listenHost = p.querySelector<HTMLInputElement>(".fwd-lhost")!.value.trim() || "127.0.0.1";
+  const listenPort = Number(p.querySelector<HTMLInputElement>(".fwd-lport")!.value);
+  const targetHost = p.querySelector<HTMLInputElement>(".fwd-thost")!.value.trim();
+  const targetPort = Number(p.querySelector<HTMLInputElement>(".fwd-tport")!.value);
+  if (!listenPort || !targetHost || !targetPort) {
+    fwdStatus(tab, "fill in listen port, target host and port", true);
+    return;
+  }
+  const cmd = kind === "local" ? "forward_add_local" : "forward_add_remote";
+  try {
+    const info = await invoke<ForwardInfo>(cmd, {
+      sessionId: tab.sessionId,
+      listenHost, listenPort, targetHost, targetPort,
+    });
+    fwdStatus(tab, `${kind === "local" ? "-L" : "-R"} :${info.listenPort} → ${targetHost}:${targetPort}`);
+    await fwdList(tab);
+  } catch (e) {
+    fwdStatus(tab, String(e), true);
+  }
+}
+
+async function fwdList(tab: SessionTab) {
+  const listEl = tab.fwdPanel?.querySelector(".fwd-list");
+  if (!listEl) return;
+  try {
+    const fwds = await invoke<ForwardInfo[]>("forward_list", {
+      sessionId: tab.sessionId,
+    });
+    listEl.innerHTML = "";
+    for (const f of fwds) {
+      const row = document.createElement("div");
+      row.className = "sftp-row";
+      row.innerHTML = `
+        <span class="ico">${f.kind === "local" ? "⇒" : "⇐"}</span>
+        <span class="fname"></span>
+        <button class="fdel" title="Remove">✕</button>`;
+      row.querySelector(".fname")!.textContent =
+        `${f.kind === "local" ? "-L" : "-R"} ${f.listenHost}:${f.listenPort} → ${f.targetHost}:${f.targetPort}`;
+      row.querySelector<HTMLButtonElement>(".fdel")!.onclick = async () => {
+        try {
+          await invoke("forward_remove", { forwardId: f.id });
+          await fwdList(tab);
+        } catch (e) {
+          fwdStatus(tab, String(e), true);
+        }
+      };
+      listEl.appendChild(row);
+    }
+    if (!fwds.length) fwdStatus(tab, "no forwards");
+  } catch (e) {
+    fwdStatus(tab, String(e), true);
   }
 }
 

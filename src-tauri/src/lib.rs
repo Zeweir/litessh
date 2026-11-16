@@ -7,7 +7,9 @@ use std::{
 
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
-use ssh_core::{AuthMethod, ConnectParams, HostKeyPrompt, SessionEvent, SshSession};
+use ssh_core::{
+    AuthMethod, ConnectParams, HostKeyPrompt, RemoteForwarder, SessionEvent, SshSession,
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 
@@ -17,6 +19,10 @@ pub struct AppState {
     sftps: Arc<Mutex<HashMap<String, Arc<SftpSession>>>>,
     /// verify_id -> pending host-key decision
     verifications: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    /// forward_id -> active forward
+    forwards: Arc<Mutex<HashMap<String, ActiveForward>>>,
+    /// session_id -> -R demux (lazily started)
+    remote_forwarders: Arc<Mutex<HashMap<String, Arc<RemoteForwarder>>>>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +192,7 @@ async fn disconnect(state: State<'_, AppState>, session_id: String) -> Result<()
     if let Ok(mut map) = state.sftps.lock() {
         map.remove(&session_id);
     }
+    remove_session_forwards(&state, &session_id);
     let session = state
         .sessions
         .lock()
@@ -352,6 +359,219 @@ async fn sftp_rename(
     sftp.rename(old_path, new_path).await.map_err(|e| e.to_string())
 }
 
+// --- port forwarding ---
+
+struct ActiveForward {
+    session_id: String,
+    kind: String,
+    listen_host: String,
+    listen_port: u16,
+    target_host: String,
+    target_port: u16,
+    /// Abort handle for -L accept loops; `None` for -R entries (their work
+    /// lives in the session's demux task).
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardInfo {
+    pub id: String,
+    /// "local" | "remote"
+    pub kind: String,
+    /// For -L the local bind; for -R the remote listen side.
+    pub listen_host: String,
+    pub listen_port: u16,
+    pub target_host: String,
+    pub target_port: u16,
+}
+
+fn info_of(id: &str, f: &ActiveForward) -> ForwardInfo {
+    ForwardInfo {
+        id: id.to_string(),
+        kind: f.kind.clone(),
+        listen_host: f.listen_host.clone(),
+        listen_port: f.listen_port,
+        target_host: f.target_host.clone(),
+        target_port: f.target_port,
+    }
+}
+
+fn get_session(state: &State<'_, AppState>, session_id: &str) -> Result<Arc<SshSession>, String> {
+    state
+        .sessions
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| "no such session".to_string())
+}
+
+#[tauri::command]
+async fn forward_add_local(
+    state: State<'_, AppState>,
+    session_id: String,
+    listen_host: String,
+    listen_port: u16,
+    target_host: String,
+    target_port: u16,
+) -> Result<ForwardInfo, String> {
+    let session = get_session(&state, &session_id)?;
+    let fwd = session
+        .start_local_forward(
+            listen_host.clone(),
+            listen_port,
+            target_host.clone(),
+            target_port,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let af = ActiveForward {
+        session_id,
+        kind: "local".into(),
+        listen_host,
+        listen_port: fwd.bound_port,
+        target_host,
+        target_port,
+        task: Some(fwd.task),
+    };
+    let info = info_of(&id, &af);
+    state
+        .forwards
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .insert(id, af);
+    Ok(info)
+}
+
+#[tauri::command]
+async fn forward_add_remote(
+    state: State<'_, AppState>,
+    session_id: String,
+    listen_host: String,
+    listen_port: u16,
+    target_host: String,
+    target_port: u16,
+) -> Result<ForwardInfo, String> {
+    let session = get_session(&state, &session_id)?;
+    // Lazily start the demux that routes accepted -R channels.
+    let existing = state
+        .remote_forwarders
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .get(&session_id)
+        .cloned();
+    let forwarder = match existing {
+        Some(f) => f,
+        None => {
+            let f = Arc::new(
+                session
+                    .start_remote_forwarder()
+                    .await
+                    .map_err(|e| format!("{e:#}"))?,
+            );
+            state
+                .remote_forwarders
+                .lock()
+                .map_err(|_| "state poisoned")?
+                .insert(session_id.clone(), f.clone());
+            f
+        }
+    };
+    let bound = session
+        .request_remote_forward(&listen_host, listen_port)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    forwarder
+        .add_route(bound as u32, target_host.clone(), target_port)
+        .await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let af = ActiveForward {
+        session_id,
+        kind: "remote".into(),
+        listen_host,
+        listen_port: bound,
+        target_host,
+        target_port,
+        task: None,
+    };
+    let info = info_of(&id, &af);
+    state
+        .forwards
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .insert(id, af);
+    Ok(info)
+}
+
+#[tauri::command]
+async fn forward_remove(
+    state: State<'_, AppState>,
+    forward_id: String,
+) -> Result<(), String> {
+    let fwd = state
+        .forwards
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .remove(&forward_id)
+        .ok_or("no such forward")?;
+    match fwd.task {
+        Some(task) => task.abort(),
+        None => {
+            // -R: remove route and tell the server to stop listening.
+            let forwarder = state
+                .remote_forwarders
+                .lock()
+                .map_err(|_| "state poisoned")?
+                .get(&fwd.session_id)
+                .cloned();
+            if let Some(f) = forwarder {
+                f.remove_route(fwd.listen_port as u32).await;
+            }
+            if let Ok(session) = get_session(&state, &fwd.session_id) {
+                let _ = session
+                    .cancel_remote_forward(&fwd.listen_host, fwd.listen_port)
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn forward_list(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<ForwardInfo>, String> {
+    let map = state.forwards.lock().map_err(|_| "state poisoned")?;
+    Ok(map
+        .iter()
+        .filter(|(_, f)| f.session_id == session_id)
+        .map(|(id, f)| info_of(id, f))
+        .collect())
+}
+
+fn remove_session_forwards(state: &State<'_, AppState>, session_id: &str) {
+    if let Ok(mut map) = state.forwards.lock() {
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, f)| f.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(f) = map.remove(&id) {
+                if let Some(t) = f.task {
+                    t.abort();
+                }
+            }
+        }
+    }
+    if let Ok(mut m) = state.remote_forwarders.lock() {
+        m.remove(session_id);
+    }
+}
+
 // --- saved hosts (passwords are never persisted) ---
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -439,6 +659,8 @@ pub fn run() {
             sessions: Mutex::new(HashMap::new()),
             sftps: Arc::new(Mutex::new(HashMap::new())),
             verifications: Arc::new(Mutex::new(HashMap::new())),
+            forwards: Arc::new(Mutex::new(HashMap::new())),
+            remote_forwarders: Arc::new(Mutex::new(HashMap::new())),
         })
         .invoke_handler(tauri::generate_handler![
             connect,
@@ -456,6 +678,10 @@ pub fn run() {
             sftp_mkdir,
             sftp_remove,
             sftp_rename,
+            forward_add_local,
+            forward_add_remote,
+            forward_remove,
+            forward_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running LiteSSH");

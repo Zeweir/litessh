@@ -261,3 +261,40 @@ body {
   text-overflow: ellipsis;
 }
 .sftp-status.err { color: var(--danger); }
+
+/* port-forward panel (reuses .sftp-panel/.sftp-list/.sftp-status) */
+.fwd-panel { width: 56%; min-width: 340px; }
+.fwd-form {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.fwd-form select,
+.fwd-form input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 6px;
+  font-size: 12px;
+  min-width: 0;
+}
+.fwd-form .fwd-kind { width: 76px; flex: none; }
+.fwd-form .fwd-lhost { flex: 2; }
+.fwd-form .fwd-lport, .fwd-form .fwd-tport { width: 58px; flex: none; }
+.fwd-form .fwd-thost { flex: 2; }
+.fwd-form .fwd-arrow { color: var(--text-dim); flex: none; }
+.fwd-form button {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 9px;
+  font-size: 12px;
+  cursor: pointer;
+  flex: none;
+}
+.fwd-form button:hover { border-color: var(--accent); color: var(--accent); }
+.fwd-list .sftp-row .fname { font-family: Consolas, monospace; font-size: 12px; }
