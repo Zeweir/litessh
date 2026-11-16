@@ -14,6 +14,11 @@
 - `~/.ssh/config` 一键导入（侧栏 ⇊ 按钮，Host/HostName/User/Port/IdentityFile）
 - 命令片段库（侧栏底部 Snippets）：保存常用命令，点击一键发送到当前终端
 - 密码可存入系统凭据库（Windows 凭据管理器 / Keychain / Secret Service）：连接时的密码弹窗勾选"记住密码"，下次一键直连
+- 终端内搜索（Ctrl+Shift+F）：高亮当前/全部命中，Enter/Shift+Enter 上下翻
+- 主机列表过滤（侧栏顶部搜索框，按名称/地址/用户名匹配）
+- 断线重连：标签页变灰后 ↻ 按钮或 Ctrl+R 复用同标签页重连
+- ProxyJump 跳板机：主机表单可选已保存的跳板机，连接经 `direct-tcpip` 通道握手；`~/.ssh/config` 的 `ProxyJump` 指令导入时自动关联已存主机
+- 连接保活（SSH keepalive 30s），NAT/网关不掉线
 
 ## 结构
 
@@ -56,3 +61,9 @@ CI 已配置（`.github/workflows/build.yml`）：Windows runner 上自动构建
 - [x] 读取 `~/.ssh/config` 导入主机
 - [x] 命令片段库
 - [x] 系统凭据存储保存密码（Windows Credential Manager / Keychain / Secret Service）
+- [x] 终端内搜索 + 主机列表过滤
+- [x] 断线重连
+- [x] ProxyJump 跳板机（`~/.ssh/config` 的 ProxyJump 一并导入）
+- [ ] 主机分组/标签
+- [ ] 会话日志/审计记录
+- [ ] 分屏终端

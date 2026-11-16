@@ -14,6 +14,7 @@
           <button id="btn-import-config" title="Import ~/.ssh/config">⇊</button>
           <button id="btn-new-host" title="New host">+</button>
         </div>
+        <input id="host-filter" placeholder="Filter hosts…" spellcheck="false" />
         <div id="host-list"></div>
         <div class="sidebar-header snippets-header">
           <span class="logo small">Snippets</span>
@@ -56,6 +57,9 @@
           </span>
         </label>
         <label class="key-only">Passphrase <input name="passphrase" type="password" /></label>
+        <label>Jump host (ProxyJump)
+          <select name="jumpHost"><option value="">— none —</option></select>
+        </label>
         <p class="hint" id="saved-pw-hint">Passwords are never saved to disk — the app asks on connect, and can remember them in the OS credential store.</p>
         <button type="button" id="btn-forget-pw" class="hidden">忘记已保存的密码</button>
         <div class="modal-actions">

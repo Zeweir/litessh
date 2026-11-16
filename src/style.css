@@ -54,6 +54,17 @@ body {
 
 #host-list { overflow-y: auto; padding: 6px; }
 
+#host-filter {
+  margin: 0 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
+}
+#host-filter:focus { outline: none; border-color: var(--accent); }
+
 .host-item {
   display: flex;
   align-items: center;
@@ -154,6 +165,37 @@ body {
 }
 .term-container { position: absolute; inset: 0; padding: 4px; }
 .term-container.hidden { display: none; }
+
+/* in-terminal search bar (Ctrl+Shift+F) */
+.term-search {
+  position: absolute;
+  top: 8px; right: 12px;
+  display: none;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  z-index: 10;
+}
+.term-search.open { display: flex; }
+.term-search input {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  width: 160px;
+}
+.term-search input:focus { outline: none; }
+.term-search button {
+  background: none; border: none; color: var(--text-dim);
+  cursor: pointer; font-size: 13px; padding: 0 3px;
+}
+.term-search button:hover { color: var(--text); }
+
+.tab .reconnect { color: var(--accent); }
+.tab .reconnect:hover { color: var(--accent); }
 
 .modal-backdrop {
   position: fixed; inset: 0;

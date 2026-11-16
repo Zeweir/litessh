@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 
 interface PasswordAnswer {
@@ -20,6 +21,7 @@ interface HostEntry {
   passwordSaved?: boolean;
   keyPath?: string;
   passphrase?: string;
+  jumpHostId?: string;
 }
 
 interface SessionTab {
@@ -27,10 +29,14 @@ interface SessionTab {
   title: string;
   term: Terminal;
   fit: FitAddon;
+  search: SearchAddon;
   el: HTMLDivElement;
   tabEl: HTMLDivElement;
   unlisteners: UnlistenFn[];
+  /** listeners on the current session's events; dropped on reconnect */
+  sessionUnlisteners: UnlistenFn[];
   dead: boolean;
+  host?: HostEntry;
   sftpPanel?: HTMLDivElement;
   sftpPath?: string;
   fwdPanel?: HTMLDivElement;
@@ -71,8 +77,19 @@ async function refreshHosts() {
 
 function renderHosts() {
   const list = $("#host-list");
+  const filter = ($("#host-filter") as HTMLInputElement).value
+    .trim()
+    .toLowerCase();
   list.innerHTML = "";
   for (const h of hosts) {
+    if (
+      filter &&
+      ![h.name, h.host, h.username, `${h.username}@${h.host}`]
+        .filter(Boolean)
+        .some((s) => s.toLowerCase().includes(filter))
+    ) {
+      continue;
+    }
     const item = document.createElement("div");
     item.className = "host-item";
     item.innerHTML = `
@@ -109,6 +126,16 @@ function openHostModal(existing?: HostEntry) {
   (form.elements.namedItem("authKind") as HTMLSelectElement).value = existing?.authKind ?? "password";
   (form.elements.namedItem("keyPath") as HTMLInputElement).value = existing?.keyPath ?? "";
   (form.elements.namedItem("passphrase") as HTMLInputElement).value = existing?.passphrase ?? "";
+  const jumpSel = form.elements.namedItem("jumpHost") as HTMLSelectElement;
+  jumpSel.innerHTML = `<option value="">— none —</option>`;
+  for (const j of hosts) {
+    if (j.id === existing?.id) continue;
+    const opt = document.createElement("option");
+    opt.value = j.id;
+    opt.textContent = j.name || `${j.username}@${j.host}`;
+    jumpSel.appendChild(opt);
+  }
+  jumpSel.value = existing?.jumpHostId ?? "";
   form.dataset.auth = ((form as HTMLFormElement).elements.namedItem("authKind") as HTMLSelectElement).value;
   $("#btn-forget-pw").classList.toggle("hidden", !existing?.passwordSaved);
   $("#host-modal").classList.remove("hidden");
@@ -182,24 +209,76 @@ void listen<HostKeyVerify>("hostkey-verify", (ev) => {
 // --- sessions & tabs ---
 
 async function connectToHost(h: HostEntry) {
-  let password: string | undefined;
-  let remember = false;
-  if (h.authKind === "password") {
-    if (h.passwordSaved) {
-      password =
-        (await invoke<string | null>("get_host_password", { hostId: h.id })) ??
-        undefined;
-    }
-    if (password === undefined) {
-      const p = await askPassword(`Password for ${h.username}@${h.host}`);
-      if (p === null) return;
-      password = p.password;
-      remember = p.remember;
-    }
-  }
   const title = h.name || `${h.username}@${h.host}`;
   const tab = createTab(title);
-  setStatus(tab, "connecting…");
+  tab.host = h;
+  await connectIntoTab(tab, h);
+}
+
+interface ResolvedAuth {
+  password?: string;
+  keyPath?: string;
+  passphrase?: string;
+  remember: boolean;
+  /** user cancelled a password prompt */
+  cancelled?: boolean;
+}
+
+async function resolveAuth(
+  h: HostEntry,
+  purpose: string,
+): Promise<ResolvedAuth> {
+  if (h.authKind === "key") {
+    return { keyPath: h.keyPath, passphrase: h.passphrase, remember: false };
+  }
+  let password = h.passwordSaved
+    ? ((await invoke<string | null>("get_host_password", { hostId: h.id })) ??
+      undefined)
+    : undefined;
+  if (password !== undefined) return { password, remember: false };
+  const p = await askPassword(`${purpose} for ${h.username}@${h.host}`);
+  if (p === null) return { cancelled: true, remember: false };
+  password = p.password;
+  return { password, remember: p.remember };
+}
+
+async function connectIntoTab(tab: SessionTab, h: HostEntry) {
+  const auth = await resolveAuth(h, "Password");
+  if (auth.cancelled) {
+    if (!tab.dead) markDead(tab);
+    return;
+  }
+  // ProxyJump: resolve the bastion's credentials too (own saved password
+  // or a second prompt).
+  let jump: Record<string, unknown> | undefined;
+  if (h.jumpHostId) {
+    const j = hosts.find((x) => x.id === h.jumpHostId);
+    if (j) {
+      const ja = await resolveAuth(j, "Jump host password");
+      if (ja.cancelled) {
+        if (!tab.dead) markDead(tab);
+        return;
+      }
+      jump = {
+        host: j.host,
+        port: j.port,
+        username: j.username,
+        password: ja.password,
+        keyPath: ja.keyPath,
+        passphrase: ja.passphrase,
+      };
+      if (ja.remember && ja.password) {
+        try {
+          await invoke("save_host_password", { hostId: j.id, password: ja.password });
+          j.passwordSaved = true;
+        } catch {
+          tab.term.write(
+            "\r\n\x1b[33m[could not save jump password to credential store]\x1b[0m\r\n",
+          );
+        }
+      }
+    }
+  }
   try {
     const { cols, rows } = termSize(tab);
     const sessionId = await invoke<string>("connect", {
@@ -207,19 +286,22 @@ async function connectToHost(h: HostEntry) {
         host: h.host,
         port: h.port,
         username: h.username,
-        password,
-        keyPath: h.authKind === "key" ? h.keyPath : undefined,
-        passphrase: h.authKind === "key" ? h.passphrase : undefined,
+        password: auth.password,
+        keyPath: auth.keyPath,
+        passphrase: auth.passphrase,
         cols,
         rows,
+        jump,
       },
     });
     tab.sessionId = sessionId;
+    tab.dead = false;
+    tab.tabEl.classList.remove("dead");
+    tab.tabEl.querySelector(".reconnect")?.remove();
     wireSessionEvents(tab);
-    setStatus(tab, "");
-    if (remember && password) {
+    if (auth.remember && auth.password) {
       try {
-        await invoke("save_host_password", { hostId: h.id, password });
+        await invoke("save_host_password", { hostId: h.id, password: auth.password });
         h.passwordSaved = true;
       } catch {
         tab.term.write(
@@ -233,12 +315,20 @@ async function connectToHost(h: HostEntry) {
   }
 }
 
-function termSize(tab: SessionTab) {
-  return { cols: tab.term.cols || 80, rows: tab.term.rows || 24 };
+async function reconnectTab(tab: SessionTab) {
+  if (!tab.host || !tab.dead) return;
+  if (tab.sessionId) {
+    void invoke("disconnect", { sessionId: tab.sessionId });
+    tab.sessionId = "";
+  }
+  for (const u of tab.sessionUnlisteners) u();
+  tab.sessionUnlisteners = [];
+  tab.term.write("\r\n\x1b[36m[reconnecting…]\x1b[0m\r\n");
+  await connectIntoTab(tab, tab.host);
 }
 
-function setStatus(tab: SessionTab, _status: string) {
-  // reserved for a status indicator in the tab bar
+function termSize(tab: SessionTab) {
+  return { cols: tab.term.cols || 80, rows: tab.term.rows || 24 };
 }
 
 function createTab(title: string): SessionTab {
@@ -255,8 +345,12 @@ function createTab(title: string): SessionTab {
     allowProposedApi: true,
   });
   const fit = new FitAddon();
+  const search = new SearchAddon();
   term.loadAddon(fit);
+  term.loadAddon(search);
   term.open(el);
+
+  el.appendChild(buildSearchBar(term, search));
 
   const tabEl = document.createElement("div");
   tabEl.className = "tab";
@@ -283,9 +377,11 @@ function createTab(title: string): SessionTab {
     title,
     term,
     fit,
+    search,
     el,
     tabEl,
     unlisteners: [],
+    sessionUnlisteners: [],
     dead: false,
   };
 
@@ -298,6 +394,20 @@ function createTab(title: string): SessionTab {
     }
   });
   term.attachCustomKeyEventHandler((e) => {
+    if (e.type === "keydown" && e.ctrlKey && e.shiftKey && e.key === "F") {
+      const bar = tab.el.querySelector<HTMLDivElement>(".term-search");
+      bar?.classList.toggle("open");
+      if (bar?.classList.contains("open")) {
+        bar.querySelector<HTMLInputElement>("input")?.focus();
+      } else {
+        tab.term.focus();
+      }
+      return false;
+    }
+    if (e.type === "keydown" && e.ctrlKey && e.key === "r" && tab.dead) {
+      void reconnectTab(tab);
+      return false;
+    }
     if (e.type === "keydown" && e.ctrlKey && e.shiftKey && e.key === "V") {
       void navigator.clipboard.readText().then((t) => {
         if (t && tab.sessionId) {
@@ -382,6 +492,49 @@ async function closeTab(tab: SessionTab) {
 function markDead(tab: SessionTab) {
   tab.dead = true;
   tab.tabEl.classList.add("dead");
+  if (tab.host && !tab.tabEl.querySelector(".reconnect")) {
+    const btn = document.createElement("button");
+    btn.className = "close reconnect";
+    btn.title = "Reconnect (Ctrl+R)";
+    btn.textContent = "↻";
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void reconnectTab(tab);
+    });
+    tab.tabEl.insertBefore(btn, tab.tabEl.lastElementChild);
+  }
+}
+
+function buildSearchBar(term: Terminal, search: SearchAddon): HTMLDivElement {
+  const bar = document.createElement("div");
+  bar.className = "term-search";
+  bar.innerHTML = `
+    <input placeholder="Search…" spellcheck="false" />
+    <button data-act="prev" title="Previous (Shift+Enter)">↑</button>
+    <button data-act="next" title="Next (Enter)">↓</button>
+    <button data-act="close" title="Close (Esc)">✕</button>`;
+  const input = bar.querySelector<HTMLInputElement>("input")!;
+  const find = (dir: "next" | "prev") => {
+    if (dir === "next") search.findNext(input.value);
+    else search.findPrevious(input.value);
+  };
+  input.addEventListener("input", () => search.findNext(input.value));
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      find(e.shiftKey ? "prev" : "next");
+    } else if (e.key === "Escape") {
+      bar.classList.remove("open");
+      term.focus();
+    }
+  });
+  bar.querySelector<HTMLButtonElement>('[data-act="prev"]')!.onclick = () => find("prev");
+  bar.querySelector<HTMLButtonElement>('[data-act="next"]')!.onclick = () => find("next");
+  bar.querySelector<HTMLButtonElement>('[data-act="close"]')!.onclick = () => {
+    bar.classList.remove("open");
+    term.focus();
+  };
+  return bar;
 }
 
 // --- SFTP panel ---
@@ -720,7 +873,7 @@ function wireSessionEvents(tab: SessionTab) {
       }
     }),
   ]);
-  void p.then((uns) => tab.unlisteners.push(...uns));
+  void p.then((uns) => tab.sessionUnlisteners.push(...uns));
 }
 
 // --- command snippets ---
@@ -773,6 +926,7 @@ async function refreshSnippets() {
 // --- wire up UI ---
 
 $("#btn-new-host").addEventListener("click", () => openHostModal());
+$("#host-filter").addEventListener("input", renderHosts);
 
 $("#btn-import-config").addEventListener("click", async () => {
   try {
@@ -818,6 +972,7 @@ $("#btn-save-snippet").addEventListener("click", async () => {
     passwordSaved: hosts.find((h) => h.id === editingHostId)?.passwordSaved ?? false,
     keyPath: (form.elements.namedItem("keyPath") as HTMLInputElement).value.trim() || undefined,
     passphrase: (form.elements.namedItem("passphrase") as HTMLInputElement).value || undefined,
+    jumpHostId: (form.elements.namedItem("jumpHost") as HTMLSelectElement).value || undefined,
   };
   void invoke<HostEntry[]>("save_host", { host }).then((saved) => {
     hosts = saved;
