@@ -13,6 +13,7 @@
 - 端口转发面板（标签页 ⇒ 按钮）：本地 -L、远程 -R、动态 -D（SOCKS5）转发，随会话断开自动清理
 - `~/.ssh/config` 一键导入（侧栏 ⇊ 按钮，Host/HostName/User/Port/IdentityFile）
 - 命令片段库（侧栏底部 Snippets）：保存常用命令，点击一键发送到当前终端
+- 密码可存入系统凭据库（Windows 凭据管理器 / Keychain / Secret Service）：连接时的密码弹窗勾选"记住密码"，下次一键直连
 
 ## 结构
 
@@ -54,4 +55,4 @@ CI 已配置（`.github/workflows/build.yml`）：Windows runner 上自动构建
 - [x] known_hosts 主机密钥校验（TOFU）
 - [x] 读取 `~/.ssh/config` 导入主机
 - [x] 命令片段库
-- [ ] Windows 凭据管理器存密码
+- [x] 系统凭据存储保存密码（Windows Credential Manager / Keychain / Secret Service）
