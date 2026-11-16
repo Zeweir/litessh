@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -25,6 +25,17 @@ interface SessionTab {
   tabEl: HTMLDivElement;
   unlisteners: UnlistenFn[];
   dead: boolean;
+  sftpPanel?: HTMLDivElement;
+  sftpPath?: string;
+}
+
+interface SftpEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  isSymlink: boolean;
+  size: number;
+  mtime?: number;
 }
 
 let hosts: HostEntry[] = [];
@@ -219,10 +230,14 @@ function createTab(title: string): SessionTab {
   dot.className = "dot";
   const label = document.createElement("span");
   label.textContent = title;
+  const sftpBtn = document.createElement("button");
+  sftpBtn.className = "close";
+  sftpBtn.title = "SFTP file browser";
+  sftpBtn.textContent = "⇄";
   const closeBtn = document.createElement("button");
   closeBtn.className = "close";
   closeBtn.textContent = "✕";
-  tabEl.append(dot, label, closeBtn);
+  tabEl.append(dot, label, sftpBtn, closeBtn);
   $("#tab-bar").appendChild(tabEl);
 
   const tab: SessionTab = {
@@ -266,7 +281,10 @@ function createTab(title: string): SessionTab {
 
   tabEl.addEventListener("click", (e) => {
     if ((e.target as HTMLElement) === closeBtn) closeTab(tab);
-    else activateTab(tab);
+    else if ((e.target as HTMLElement) === sftpBtn) {
+      activateTab(tab);
+      void toggleSftp(tab);
+    } else activateTab(tab);
   });
   tabEl.addEventListener("auxclick", (e) => {
     if (e.button === 1) closeTab(tab);
@@ -323,6 +341,191 @@ async function closeTab(tab: SessionTab) {
 function markDead(tab: SessionTab) {
   tab.dead = true;
   tab.tabEl.classList.add("dead");
+}
+
+// --- SFTP panel ---
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[i]}`;
+}
+
+function sftpStatus(tab: SessionTab, msg: string, isErr = false) {
+  const el = tab.sftpPanel?.querySelector(".sftp-status");
+  if (el) {
+    el.textContent = msg;
+    el.classList.toggle("err", isErr);
+  }
+}
+
+async function toggleSftp(tab: SessionTab) {
+  if (!tab.sessionId) return;
+  if (!tab.sftpPanel) {
+    const panel = document.createElement("div");
+    panel.className = "sftp-panel";
+    panel.innerHTML = `
+      <div class="sftp-toolbar">
+        <button data-act="up" title="Parent dir">↑</button>
+        <input class="sftp-path" spellcheck="false" />
+        <button data-act="refresh" title="Refresh">⟳</button>
+        <button data-act="upload" title="Upload files">⇪</button>
+        <button data-act="mkdir" title="New directory">+📁</button>
+      </div>
+      <div class="sftp-list"></div>
+      <div class="sftp-status"></div>`;
+    panel.querySelector<HTMLButtonElement>('[data-act="up"]')!.onclick = () => {
+      const p = tab.sftpPath ?? "/";
+      const parent = p === "/" ? "/" : p.replace(/\/+$/, "").replace(/\/[^\/]*$/, "") || "/";
+      void sftpList(tab, parent);
+    };
+    panel.querySelector<HTMLButtonElement>('[data-act="refresh"]')!.onclick = () =>
+      void sftpList(tab, tab.sftpPath ?? ".");
+    panel.querySelector<HTMLButtonElement>('[data-act="upload"]')!.onclick = () =>
+      void sftpUpload(tab);
+    panel.querySelector<HTMLButtonElement>('[data-act="mkdir"]')!.onclick = () =>
+      sftpMkdirRow(tab);
+    panel.querySelector<HTMLInputElement>(".sftp-path")!.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") void sftpList(tab, (e.target as HTMLInputElement).value);
+    });
+    tab.el.appendChild(panel);
+    tab.sftpPanel = panel;
+    // resolve the initial directory (~ on most servers)
+    try {
+      const home = await invoke<string>("sftp_canonicalize", {
+        sessionId: tab.sessionId, path: ".",
+      });
+      await sftpList(tab, home);
+    } catch (e) {
+      sftpStatus(tab, String(e), true);
+    }
+  }
+  tab.sftpPanel.classList.toggle("open");
+  if (tab.sftpPanel.classList.contains("open") && tab.sftpPath) {
+    void sftpList(tab, tab.sftpPath);
+  }
+}
+
+async function sftpList(tab: SessionTab, path: string) {
+  const listEl = tab.sftpPanel?.querySelector(".sftp-list");
+  const pathEl = tab.sftpPanel?.querySelector<HTMLInputElement>(".sftp-path");
+  if (!listEl || !pathEl) return;
+  try {
+    sftpStatus(tab, "loading…");
+    const entries = await invoke<SftpEntry[]>("sftp_list", {
+      sessionId: tab.sessionId, path,
+    });
+    tab.sftpPath = path;
+    pathEl.value = path;
+    entries.sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name));
+    listEl.innerHTML = "";
+    for (const e of entries) {
+      const row = document.createElement("div");
+      row.className = "sftp-row";
+      row.innerHTML = `
+        <span class="ico">${e.isDir ? "📁" : e.isSymlink ? "🔗" : "📄"}</span>
+        <span class="fname"></span>
+        <span class="fsize">${e.isDir ? "" : fmtSize(e.size)}</span>
+        <button class="fdel" title="Delete">✕</button>`;
+      row.querySelector(".fname")!.textContent = e.name;
+      row.addEventListener("dblclick", () => {
+        if (e.isDir) void sftpList(tab, e.path);
+        else void sftpDownload(tab, e);
+      });
+      const del = row.querySelector<HTMLButtonElement>(".fdel")!;
+      del.addEventListener("click", () => {
+        if (del.dataset.confirm === "1") {
+          del.dataset.confirm = "";
+          del.classList.remove("armed");
+          void sftpRemove(tab, e);
+        } else {
+          del.dataset.confirm = "1";
+          del.classList.add("armed");
+          setTimeout(() => { del.dataset.confirm = ""; del.classList.remove("armed"); }, 3000);
+        }
+      });
+      listEl.appendChild(row);
+    }
+    sftpStatus(tab, `${entries.length} entries`);
+  } catch (e) {
+    sftpStatus(tab, String(e), true);
+  }
+}
+
+function sftpMkdirRow(tab: SessionTab) {
+  const listEl = tab.sftpPanel?.querySelector(".sftp-list");
+  if (!listEl) return;
+  const row = document.createElement("div");
+  row.className = "sftp-row mkdir-row";
+  row.innerHTML = `<span class="ico">📁</span><input class="fname mkdir-input" placeholder="new directory name" />`;
+  listEl.prepend(row);
+  const input = row.querySelector<HTMLInputElement>(".mkdir-input")!;
+  input.focus();
+  input.addEventListener("keydown", async (ev) => {
+    if (ev.key === "Escape") row.remove();
+    if (ev.key !== "Enter") return;
+    const name = input.value.trim();
+    if (!name) { row.remove(); return; }
+    const base = (tab.sftpPath ?? "/").replace(/\/+$/, "");
+    try {
+      await invoke("sftp_mkdir", {
+        sessionId: tab.sessionId, path: `${base}/${name}`,
+      });
+      await sftpList(tab, tab.sftpPath ?? "/");
+    } catch (e) {
+      sftpStatus(tab, String(e), true);
+      row.remove();
+    }
+  });
+  input.addEventListener("blur", () => row.remove());
+}
+
+async function sftpDownload(tab: SessionTab, entry: SftpEntry) {
+  const dest = await save({ defaultPath: entry.name });
+  if (!dest) return;
+  try {
+    sftpStatus(tab, `downloading ${entry.name}…`);
+    const n = await invoke<number>("sftp_download", {
+      sessionId: tab.sessionId, remotePath: entry.path, localPath: dest,
+    });
+    sftpStatus(tab, `saved ${fmtSize(n)} → ${dest}`);
+  } catch (e) {
+    sftpStatus(tab, String(e), true);
+  }
+}
+
+async function sftpUpload(tab: SessionTab) {
+  const sel = await open({ multiple: true, directory: false });
+  if (!sel) return;
+  const files = Array.isArray(sel) ? sel : [sel];
+  const base = (tab.sftpPath ?? "/").replace(/\/+$/, "");
+  for (const local of files) {
+    const name = local.split(/[\\/]/).pop()!;
+    try {
+      sftpStatus(tab, `uploading ${name}…`);
+      const n = await invoke<number>("sftp_upload", {
+        sessionId: tab.sessionId, localPath: local, remotePath: `${base}/${name}`,
+      });
+      sftpStatus(tab, `uploaded ${fmtSize(n)} (${name})`);
+    } catch (e) {
+      sftpStatus(tab, String(e), true);
+    }
+  }
+  await sftpList(tab, tab.sftpPath ?? "/");
+}
+
+async function sftpRemove(tab: SessionTab, entry: SftpEntry) {
+  try {
+    await invoke("sftp_remove", {
+      sessionId: tab.sessionId, path: entry.path, isDir: entry.isDir,
+    });
+    await sftpList(tab, tab.sftpPath ?? "/");
+  } catch (e) {
+    sftpStatus(tab, String(e), true);
+  }
 }
 
 function wireSessionEvents(tab: SessionTab) {

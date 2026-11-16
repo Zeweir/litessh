@@ -30,6 +30,9 @@ struct Args {
     /// Changed keys still require a manual `yes`.
     #[arg(long)]
     yes: bool,
+    /// After connecting, list this remote directory over SFTP and exit.
+    #[arg(long)]
+    sftp_ls: Option<String>,
 }
 
 #[tokio::main]
@@ -87,6 +90,22 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session = SshSession::connect(&params, tx).await?;
     eprintln!("[connected]");
+
+    if let Some(dir) = args.sftp_ls {
+        let sftp = session.open_sftp().await?;
+        for e in sftp.read_dir(dir).await? {
+            let m = e.metadata();
+            println!(
+                "{}\t{}\t{}",
+                if e.file_type().is_dir() { "d" } else { "-" },
+                m.len(),
+                e.path(),
+            );
+        }
+        session.disconnect().await.ok();
+        return Ok(());
+    }
+
     session.write(args.cmd.as_bytes()).await?;
 
     let deadline = tokio::time::sleep(Duration::from_secs(args.timeout_secs));

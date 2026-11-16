@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
 use ssh_core::{AuthMethod, ConnectParams, HostKeyPrompt, SessionEvent, SshSession};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -12,6 +13,8 @@ use tokio::sync::{mpsc, oneshot};
 
 pub struct AppState {
     sessions: Mutex<HashMap<String, Arc<SshSession>>>,
+    /// session_id -> lazily opened SFTP channel
+    sftps: Arc<Mutex<HashMap<String, Arc<SftpSession>>>>,
     /// verify_id -> pending host-key decision
     verifications: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
 }
@@ -180,6 +183,9 @@ async fn resize(
 
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    if let Ok(mut map) = state.sftps.lock() {
+        map.remove(&session_id);
+    }
     let session = state
         .sessions
         .lock()
@@ -189,6 +195,161 @@ async fn disconnect(state: State<'_, AppState>, session_id: String) -> Result<()
         Some(s) => s.disconnect().await.map_err(|e| format!("{e:#}")),
         None => Ok(()),
     }
+}
+
+// --- SFTP ---
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    /// unix seconds
+    pub mtime: Option<u64>,
+}
+
+async fn get_sftp(
+    state: &State<'_, AppState>,
+    session_id: &str,
+) -> Result<Arc<SftpSession>, String> {
+    if let Some(s) = state
+        .sftps
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .get(session_id)
+    {
+        return Ok(s.clone());
+    }
+    let session = {
+        let sessions = state.sessions.lock().map_err(|_| "state poisoned")?;
+        sessions.get(session_id).cloned()
+    }
+    .ok_or("no such session")?;
+    let sftp = Arc::new(
+        session
+            .open_sftp()
+            .await
+            .map_err(|e| format!("{e:#}"))?,
+    );
+    state
+        .sftps
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .insert(session_id.to_string(), sftp.clone());
+    Ok(sftp)
+}
+
+#[tauri::command]
+async fn sftp_list(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<Vec<SftpEntry>, String> {
+    let sftp = get_sftp(&state, &session_id).await?;
+    let dir = sftp
+        .read_dir(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(dir
+        .map(|e| {
+            let meta = e.metadata();
+            SftpEntry {
+                name: e.file_name(),
+                path: e.path(),
+                is_dir: e.file_type().is_dir(),
+                is_symlink: e.file_type().is_symlink(),
+                size: meta.len(),
+                mtime: meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()),
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn sftp_canonicalize(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<String, String> {
+    let sftp = get_sftp(&state, &session_id).await?;
+    sftp.canonicalize(path).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sftp_download(
+    state: State<'_, AppState>,
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<u64, String> {
+    let sftp = get_sftp(&state, &session_id).await?;
+    let mut src = sftp.open(remote_path).await.map_err(|e| e.to_string())?;
+    let mut dst = tokio::fs::File::create(local_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::io::copy(&mut src, &mut dst)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sftp_upload(
+    state: State<'_, AppState>,
+    session_id: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<u64, String> {
+    let sftp = get_sftp(&state, &session_id).await?;
+    let mut src = tokio::fs::File::open(local_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut dst = sftp.create(remote_path).await.map_err(|e| e.to_string())?;
+    tokio::io::copy(&mut src, &mut dst)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sftp_mkdir(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    let sftp = get_sftp(&state, &session_id).await?;
+    sftp.create_dir(path).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn sftp_remove(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+    is_dir: bool,
+) -> Result<(), String> {
+    let sftp = get_sftp(&state, &session_id).await?;
+    if is_dir {
+        sftp.remove_dir(path).await.map_err(|e| e.to_string())
+    } else {
+        sftp.remove_file(path).await.map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+async fn sftp_rename(
+    state: State<'_, AppState>,
+    session_id: String,
+    old_path: String,
+    new_path: String,
+) -> Result<(), String> {
+    let sftp = get_sftp(&state, &session_id).await?;
+    sftp.rename(old_path, new_path).await.map_err(|e| e.to_string())
 }
 
 // --- saved hosts (passwords are never persisted) ---
@@ -276,6 +437,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             sessions: Mutex::new(HashMap::new()),
+            sftps: Arc::new(Mutex::new(HashMap::new())),
             verifications: Arc::new(Mutex::new(HashMap::new())),
         })
         .invoke_handler(tauri::generate_handler![
@@ -287,6 +449,13 @@ pub fn run() {
             save_host,
             delete_host,
             resolve_hostkey,
+            sftp_list,
+            sftp_canonicalize,
+            sftp_download,
+            sftp_upload,
+            sftp_mkdir,
+            sftp_remove,
+            sftp_rename,
         ])
         .run(tauri::generate_context!())
         .expect("error while running LiteSSH");

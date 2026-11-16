@@ -168,3 +168,96 @@ body {
 .mono { font-family: Consolas, monospace; }
 .warning { color: var(--danger); font-size: 12.5px; line-height: 1.5; }
 #hostkey-desc { font-size: 13px; color: var(--text-dim); }
+
+/* --- SFTP panel --- */
+.sftp-panel {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 46%;
+  min-width: 300px;
+  background: var(--bg-alt);
+  border-left: 1px solid var(--border);
+  display: none;
+  flex-direction: column;
+  z-index: 20;
+}
+.sftp-panel.open { display: flex; }
+
+.sftp-toolbar {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.sftp-toolbar .sftp-path {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: Consolas, monospace;
+}
+.sftp-toolbar button {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sftp-toolbar button:hover { border-color: var(--accent); color: var(--accent); }
+
+.sftp-list {
+  flex: 1;
+  overflow-y: auto;
+  font-size: 12.5px;
+}
+.sftp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  cursor: default;
+  user-select: none;
+}
+.sftp-row:hover { background: rgba(255, 255, 255, 0.05); }
+.sftp-row .fname {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sftp-row .fsize { color: var(--text-dim); font-size: 11.5px; min-width: 56px; text-align: right; }
+.sftp-row .fdel {
+  visibility: hidden;
+  background: none; border: none; color: var(--text-dim);
+  cursor: pointer; font-size: 12px; padding: 0 2px;
+}
+.sftp-row:hover .fdel { visibility: visible; }
+.sftp-row .fdel:hover, .sftp-row .fdel.armed { color: var(--danger); visibility: visible; }
+.sftp-row .fdel.armed { border: 1px solid var(--danger); border-radius: 4px; }
+
+.mkdir-input {
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 2px 6px;
+  font-size: 12.5px;
+}
+
+.sftp-status {
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sftp-status.err { color: var(--danger); }

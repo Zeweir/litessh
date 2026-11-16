@@ -204,7 +204,7 @@ impl Handler for ClientHandler {
 /// server output into `SessionEvent`s.
 pub struct SshSession {
     write_half: ChannelWriteHalf<client::Msg>,
-    _handle: Handle<ClientHandler>,
+    handle: Handle<ClientHandler>,
 }
 
 impl SshSession {
@@ -291,7 +291,7 @@ impl SshSession {
 
         Ok(Self {
             write_half,
-            _handle: handle,
+            handle,
         })
     }
 
@@ -310,5 +310,16 @@ impl SshSession {
     pub async fn disconnect(&self) -> anyhow::Result<()> {
         self.write_half.close().await?;
         Ok(())
+    }
+
+    /// Open an SFTP subsystem channel on this session.
+    pub async fn open_sftp(&self) -> anyhow::Result<russh_sftp::client::SftpSession> {
+        let channel = self.handle.channel_open_session().await?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .context("request_subsystem sftp failed")?;
+        let sftp = russh_sftp::client::SftpSession::new(channel.into_stream()).await?;
+        Ok(sftp)
     }
 }
