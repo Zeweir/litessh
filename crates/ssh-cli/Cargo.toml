@@ -1,0 +1,12 @@
+[package]
+name = "ssh-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI smoke test for ssh-core"
+
+[dependencies]
+ssh-core = { path = "../ssh-core" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }

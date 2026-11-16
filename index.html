@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LiteSSH</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <span class="logo">LiteSSH</span>
+          <button id="btn-new-host" title="New host">+</button>
+        </div>
+        <div id="host-list"></div>
+      </aside>
+      <main id="main">
+        <div id="tab-bar"></div>
+        <div id="terminal-area">
+          <div id="empty-state">
+            <p>Select a host on the left to connect.</p>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <div id="host-modal" class="modal-backdrop hidden">
+      <form id="host-form" class="modal">
+        <h2 id="host-form-title">New host</h2>
+        <label>Name <input name="name" placeholder="my-server" /></label>
+        <label>Host <input name="host" required placeholder="192.168.1.10" /></label>
+        <label>Port <input name="port" type="number" value="22" min="1" max="65535" /></label>
+        <label>Username <input name="username" required /></label>
+        <label>Auth
+          <select name="authKind">
+            <option value="password">Password</option>
+            <option value="key">Private key</option>
+          </select>
+        </label>
+        <label class="key-only">Key file
+          <span class="row">
+            <input name="keyPath" placeholder="~/.ssh/id_ed25519" />
+            <button type="button" id="btn-browse-key">…</button>
+          </span>
+        </label>
+        <label class="key-only">Passphrase <input name="passphrase" type="password" /></label>
+        <p class="hint">Passwords are never saved — you will be asked on connect.</p>
+        <div class="modal-actions">
+          <button type="button" id="btn-cancel-host">Cancel</button>
+          <button type="submit" class="primary">Save</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="password-modal" class="modal-backdrop hidden">
+      <form id="password-form" class="modal">
+        <h2 id="password-title">Password</h2>
+        <input name="password" type="password" required autocomplete="off" />
+        <div class="modal-actions">
+          <button type="button" id="btn-cancel-password">Cancel</button>
+          <button type="submit" class="primary">Connect</button>
+        </div>
+      </form>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
