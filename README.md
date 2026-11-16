@@ -8,6 +8,7 @@
 - 标签页终端（xterm.js），支持多会话
 - 密码 / 私钥（含 passphrase、`~` 路径）认证
 - PTY 交互 shell、窗口大小自适应、Ctrl+Shift+C/V 复制粘贴
+- known_hosts 主机密钥校验（TOFU）：首次连接弹窗确认 SHA256 指纹，密钥变更时强警告；记录存于应用配置目录 `known_hosts`（OpenSSH 格式）
 
 ## 结构
 
@@ -44,6 +45,6 @@ CI 已配置（`.github/workflows/build.yml`）：Windows runner 上自动构建
 
 - [ ] SFTP 双栏文件传输
 - [ ] 本地/远程/动态端口转发
-- [ ] known_hosts 主机密钥校验（TOFU）
+- [x] known_hosts 主机密钥校验（TOFU）
 - [ ] 读取 `~/.ssh/config`、命令片段库
 - [ ] Windows 凭据管理器存密码

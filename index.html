@@ -53,6 +53,27 @@
       </form>
     </div>
 
+    <div id="hostkey-modal" class="modal-backdrop hidden">
+      <div class="modal">
+        <h2 id="hostkey-title">Trust this host?</h2>
+        <p id="hostkey-desc"></p>
+        <dl class="kv">
+          <dt>Host</dt><dd id="hostkey-host"></dd>
+          <dt>Key type</dt><dd id="hostkey-algo"></dd>
+          <dt>SHA256</dt><dd id="hostkey-fp" class="mono"></dd>
+        </dl>
+        <p id="hostkey-warning" class="warning hidden">
+          ⚠ The host key CHANGED since last connection — this may be a
+          man-in-the-middle attack. Only continue if you know why it changed
+          (e.g. server reinstalled).
+        </p>
+        <div class="modal-actions">
+          <button type="button" id="btn-hostkey-reject">Reject</button>
+          <button type="button" id="btn-hostkey-accept" class="primary">Trust &amp; connect</button>
+        </div>
+      </div>
+    </div>
+
     <div id="password-modal" class="modal-backdrop hidden">
       <form id="password-form" class="modal">
         <h2 id="password-title">Password</h2>

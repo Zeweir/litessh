@@ -23,6 +23,13 @@ struct Args {
     cmd: String,
     #[arg(long, default_value_t = 15)]
     timeout_secs: u64,
+    /// known_hosts file for server-key verification (TOFU).
+    #[arg(long, default_value = "~/.ssh/known_hosts")]
+    known_hosts: PathBuf,
+    /// Skip the interactive prompt and trust a new host key.
+    /// Changed keys still require a manual `yes`.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[tokio::main]
@@ -39,11 +46,41 @@ async fn main() -> Result<()> {
         AuthMethod::Password(args.password.unwrap_or_default())
     };
 
+    let (prompt_tx, mut prompt_rx) =
+        mpsc::unbounded_channel::<ssh_core::HostKeyPrompt>();
+    let auto_accept = args.yes;
+    tokio::spawn(async move {
+        while let Some(prompt) = prompt_rx.recv().await {
+            let tag = if prompt.changed { "CHANGED" } else { "new" };
+            eprintln!(
+                "[hostkey {tag}] {}:{} {} {}",
+                prompt.host, prompt.port, prompt.algorithm, prompt.fingerprint
+            );
+            let accept = if auto_accept && !prompt.changed {
+                eprintln!("[hostkey] auto-accepted");
+                true
+            } else {
+                eprint!("Trust this host key? [y/N] ");
+                let answer = tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    let _ = std::io::stdin().read_line(&mut line);
+                    line
+                })
+                .await
+                .unwrap_or_default();
+                answer.trim().eq_ignore_ascii_case("y")
+            };
+            let _ = prompt.decision.send(accept);
+        }
+    });
+
     let params = ConnectParams {
         host: args.host,
         port: args.port,
         username: args.user,
         auth,
+        known_hosts_path: Some(ssh_core::expand_tilde(&args.known_hosts)),
+        hostkey_prompt_tx: Some(prompt_tx),
         ..Default::default()
     };
 

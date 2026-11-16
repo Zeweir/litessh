@@ -32,6 +32,7 @@ let tabs: SessionTab[] = [];
 let activeTab: SessionTab | null = null;
 let editingHostId: string | null = null;
 let passwordResolve: ((v: string | null) => void) | null = null;
+const hostkeyQueue: HostKeyVerify[] = [];
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
@@ -108,6 +109,49 @@ function closePasswordModal(result: string | null) {
   passwordResolve?.(result);
   passwordResolve = null;
 }
+
+// --- host key verification (TOFU) ---
+
+interface HostKeyVerify {
+  verifyId: string;
+  host: string;
+  port: number;
+  algorithm: string;
+  fingerprint: string;
+  changed: boolean;
+}
+
+function resolveHostkey(verifyId: string, accept: boolean) {
+  void invoke("resolve_hostkey", { verifyId, accept });
+}
+
+function showHostKeyModal(v: HostKeyVerify) {
+  $("#hostkey-host").textContent = `${v.host}:${v.port}`;
+  $("#hostkey-algo").textContent = v.algorithm;
+  $("#hostkey-fp").textContent = v.fingerprint;
+  $("#hostkey-desc").textContent = v.changed
+    ? "The server's host key does not match the stored one."
+    : "First connection to this server — verify its fingerprint.";
+  $("#hostkey-warning").classList.toggle("hidden", !v.changed);
+  $("#hostkey-modal").classList.remove("hidden");
+
+  const done = (accept: boolean) => {
+    $("#hostkey-modal").classList.add("hidden");
+    resolveHostkey(v.verifyId, accept);
+    const next = hostkeyQueue.shift();
+    if (next) showHostKeyModal(next);
+  };
+  $("#btn-hostkey-accept").onclick = () => done(true);
+  $("#btn-hostkey-reject").onclick = () => done(false);
+}
+
+void listen<HostKeyVerify>("hostkey-verify", (ev) => {
+  if (!$("#hostkey-modal").classList.contains("hidden")) {
+    hostkeyQueue.push(ev.payload);
+  } else {
+    showHostKeyModal(ev.payload);
+  }
+});
 
 // --- sessions & tabs ---
 

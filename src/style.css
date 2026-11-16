@@ -161,3 +161,10 @@ body {
 .modal-actions button.primary:hover { filter: brightness(1.1); }
 
 #host-form[data-auth="password"] .key-only { display: none; }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+.kv dt { color: var(--text-dim); }
+.kv dd { word-break: break-all; }
+.mono { font-family: Consolas, monospace; }
+.warning { color: var(--danger); font-size: 12.5px; line-height: 1.5; }
+#hostkey-desc { font-size: 13px; color: var(--text-dim); }
