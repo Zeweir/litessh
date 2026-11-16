@@ -11,6 +11,7 @@ use russh::{
     Channel, ChannelMsg, ChannelOpenFailure, ChannelWriteHalf,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
@@ -408,6 +409,40 @@ impl SshSession {
         Ok(Forward { bound_port, task })
     }
 
+    /// Start a dynamic (-D) SOCKS5 forward: every CONNECT request is
+    /// bridged to its destination through a direct-tcpip channel.
+    /// Supports the no-auth method, IPv4/domain/IPv6 targets.
+    pub async fn start_socks5_forward(
+        self: &Arc<Self>,
+        listen_host: String,
+        listen_port: u16,
+    ) -> anyhow::Result<Forward> {
+        let listener = TcpListener::bind((listen_host.as_str(), listen_port))
+            .await
+            .with_context(|| format!("bind {listen_host}:{listen_port}"))?;
+        let bound_port = listener.local_addr()?.port();
+        let session = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((tcp, _)) => {
+                        let sess = Arc::clone(&session);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_socks5_conn(tcp, &sess).await {
+                                tracing::warn!("socks5 conn failed: {e:#}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("socks5 accept failed: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Forward { bound_port, task })
+    }
+
     /// Create the per-session demux for remote (-R) forwards. Only the
     /// first call succeeds.
     pub async fn start_remote_forwarder(self: &Arc<Self>) -> anyhow::Result<RemoteForwarder> {
@@ -487,4 +522,92 @@ impl SshSession {
         let sftp = russh_sftp::client::SftpSession::new(channel.into_stream()).await?;
         Ok(sftp)
     }
+}
+
+/// Minimal SOCKS5 (RFC 1928) no-auth CONNECT handshake, then bidirectional
+/// piping into a direct-tcpip channel.
+async fn handle_socks5_conn(
+    mut tcp: TcpStream,
+    session: &Arc<SshSession>,
+) -> anyhow::Result<()> {
+    // --- greeting: VER, NMETHODS, METHODS ---
+    let mut head = [0u8; 2];
+    tcp.read_exact(&mut head).await?;
+    if head[0] != 0x05 {
+        bail!("not a SOCKS5 greeting");
+    }
+    let mut methods = vec![0u8; head[1] as usize];
+    tcp.read_exact(&mut methods).await?;
+    if !methods.contains(&0x00) {
+        tcp.write_all(&[0x05, 0xFF]).await?; // no acceptable methods
+        bail!("client requires auth");
+    }
+    tcp.write_all(&[0x05, 0x00]).await?; // choose no-auth
+
+    // --- request: VER, CMD, RSV, ATYP, ADDR, PORT ---
+    let mut req = [0u8; 4];
+    tcp.read_exact(&mut req).await?;
+    if req[0] != 0x05 || req[1] != 0x01 {
+        socks5_reply(&mut tcp, 0x07).await.ok(); // command not supported
+        bail!("only CONNECT is supported");
+    }
+    let (host, port) = match req[3] {
+        0x01 => {
+            let mut a = [0u8; 6];
+            tcp.read_exact(&mut a).await?;
+            (
+                format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]),
+                u16::from_be_bytes([a[4], a[5]]),
+            )
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            tcp.read_exact(&mut len).await?;
+            let mut buf = vec![0u8; len[0] as usize + 2];
+            tcp.read_exact(&mut buf).await?;
+            let n = buf.len();
+            (
+                String::from_utf8_lossy(&buf[..n - 2]).into_owned(),
+                u16::from_be_bytes([buf[n - 2], buf[n - 1]]),
+            )
+        }
+        0x04 => {
+            let mut a = [0u8; 18];
+            tcp.read_exact(&mut a).await?;
+            let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&a[..16])?);
+            (ip.to_string(), u16::from_be_bytes([a[16], a[17]]))
+        }
+        _ => bail!("unknown ATYP"),
+    };
+
+    let channel = match session
+        .handle
+        .channel_open_direct_tcpip(
+            host.clone(),
+            port as u32,
+            "127.0.0.1",
+            0,
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            socks5_reply(&mut tcp, 0x05).await.ok(); // connection refused
+            bail!("direct-tcpip to {host}:{port} failed: {e}");
+        }
+    };
+    socks5_reply(&mut tcp, 0x00).await?; // success
+    let mut stream = channel.into_stream();
+    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+    Ok(())
+}
+
+/// Send a minimal SOCKS5 reply bound to 0.0.0.0:0.
+async fn socks5_reply(tcp: &mut TcpStream, rep: u8) -> anyhow::Result<()> {
+    let mut buf = [0u8; 10];
+    buf[0] = 0x05;
+    buf[1] = rep;
+    buf[3] = 0x01;
+    tcp.write_all(&buf).await?;
+    Ok(())
 }

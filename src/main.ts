@@ -540,7 +540,7 @@ async function sftpRemove(tab: SessionTab, entry: SftpEntry) {
 
 interface ForwardInfo {
   id: string;
-  kind: "local" | "remote";
+  kind: "local" | "remote" | "dynamic";
   listenHost: string;
   listenPort: number;
   targetHost: string;
@@ -565,6 +565,7 @@ function toggleFwd(tab: SessionTab) {
         <select class="fwd-kind" title="Forward type">
           <option value="local">-L local</option>
           <option value="remote">-R remote</option>
+          <option value="dynamic">-D socks5</option>
         </select>
         <input class="fwd-lhost" value="127.0.0.1" placeholder="listen host" />
         <input class="fwd-lport" placeholder="listen port" inputmode="numeric" />
@@ -577,6 +578,13 @@ function toggleFwd(tab: SessionTab) {
       <div class="sftp-status"></div>`;
     panel.querySelector<HTMLButtonElement>('[data-act="add"]')!.onclick = () =>
       void fwdAdd(tab);
+    // -D needs no target fields
+    panel.querySelector<HTMLSelectElement>(".fwd-kind")!.onchange = (e) => {
+      const isD = (e.target as HTMLSelectElement).value === "dynamic";
+      for (const sel of [".fwd-thost", ".fwd-tport", ".fwd-arrow"]) {
+        (panel.querySelector(sel) as HTMLElement).style.visibility = isD ? "hidden" : "";
+      }
+    };
     tab.el.appendChild(panel);
     tab.fwdPanel = panel;
     void fwdList(tab);
@@ -592,6 +600,22 @@ async function fwdAdd(tab: SessionTab) {
   const listenPort = Number(p.querySelector<HTMLInputElement>(".fwd-lport")!.value);
   const targetHost = p.querySelector<HTMLInputElement>(".fwd-thost")!.value.trim();
   const targetPort = Number(p.querySelector<HTMLInputElement>(".fwd-tport")!.value);
+  if (kind === "dynamic") {
+    if (!listenPort) {
+      fwdStatus(tab, "fill in listen port", true);
+      return;
+    }
+    try {
+      const info = await invoke<ForwardInfo>("forward_add_dynamic", {
+        sessionId: tab.sessionId, listenHost, listenPort,
+      });
+      fwdStatus(tab, `-D socks5 ${info.listenHost}:${info.listenPort}`);
+      await fwdList(tab);
+    } catch (e) {
+      fwdStatus(tab, String(e), true);
+    }
+    return;
+  }
   if (!listenPort || !targetHost || !targetPort) {
     fwdStatus(tab, "fill in listen port, target host and port", true);
     return;
@@ -621,11 +645,12 @@ async function fwdList(tab: SessionTab) {
       const row = document.createElement("div");
       row.className = "sftp-row";
       row.innerHTML = `
-        <span class="ico">${f.kind === "local" ? "⇒" : "⇐"}</span>
+        <span class="ico">${f.kind === "local" ? "⇒" : f.kind === "remote" ? "⇐" : "⇶"}</span>
         <span class="fname"></span>
         <button class="fdel" title="Remove">✕</button>`;
-      row.querySelector(".fname")!.textContent =
-        `${f.kind === "local" ? "-L" : "-R"} ${f.listenHost}:${f.listenPort} → ${f.targetHost}:${f.targetPort}`;
+      row.querySelector(".fname")!.textContent = f.kind === "dynamic"
+        ? `-D socks5 ${f.listenHost}:${f.listenPort}`
+        : `${f.kind === "local" ? "-L" : "-R"} ${f.listenHost}:${f.listenPort} → ${f.targetHost}:${f.targetPort}`;
       row.querySelector<HTMLButtonElement>(".fdel")!.onclick = async () => {
         try {
           await invoke("forward_remove", { forwardId: f.id });
@@ -668,6 +693,18 @@ function wireSessionEvents(tab: SessionTab) {
 // --- wire up UI ---
 
 $("#btn-new-host").addEventListener("click", () => openHostModal());
+
+$("#btn-import-config").addEventListener("click", async () => {
+  try {
+    const before = hosts.length;
+    hosts = await invoke<HostEntry[]>("import_ssh_config", { path: null });
+    renderHosts();
+    const added = hosts.length - before;
+    alert(added > 0 ? `Imported ${added} host(s) from ~/.ssh/config.` : "~/.ssh/config imported (no new hosts).");
+  } catch (e) {
+    alert(`Import failed: ${String(e)}`);
+  }
+});
 $("#btn-cancel-host").addEventListener("click", closeHostModal);
 
 ($("#host-form") as HTMLFormElement).addEventListener("submit", (e) => {

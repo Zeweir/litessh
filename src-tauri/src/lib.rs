@@ -506,6 +506,37 @@ async fn forward_add_remote(
 }
 
 #[tauri::command]
+async fn forward_add_dynamic(
+    state: State<'_, AppState>,
+    session_id: String,
+    listen_host: String,
+    listen_port: u16,
+) -> Result<ForwardInfo, String> {
+    let session = get_session(&state, &session_id)?;
+    let fwd = session
+        .start_socks5_forward(listen_host.clone(), listen_port)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let af = ActiveForward {
+        session_id,
+        kind: "dynamic".into(),
+        listen_host,
+        listen_port: fwd.bound_port,
+        target_host: String::new(),
+        target_port: 0,
+        task: Some(fwd.task),
+    };
+    let info = info_of(&id, &af);
+    state
+        .forwards
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .insert(id, af);
+    Ok(info)
+}
+
+#[tauri::command]
 async fn forward_remove(
     state: State<'_, AppState>,
     forward_id: String,
@@ -650,6 +681,55 @@ fn delete_host(app: AppHandle, host_id: String) -> Result<Vec<HostEntry>, String
     Ok(hosts)
 }
 
+/// Parse `path` (default `~/.ssh/config`) and merge concrete Host blocks
+/// into the saved list. Existing entries whose name matches an alias are
+/// replaced; returns the new list.
+#[tauri::command]
+fn import_ssh_config(
+    app: AppHandle,
+    path: Option<String>,
+) -> Result<Vec<HostEntry>, String> {
+    let cfg_path = match path.filter(|s| !s.is_empty()) {
+        Some(p) => ssh_core::expand_tilde(&PathBuf::from(p)),
+        None => dirs_fallback_home().join(".ssh").join("config"),
+    };
+    let parsed = ssh_core::read_ssh_config(&cfg_path).map_err(|e| e.to_string())?;
+    let mut hosts = list_hosts(app.clone())?;
+    for h in parsed {
+        let key_path = h.identity_file.map(|p| {
+            ssh_core::expand_tilde(&PathBuf::from(&p))
+                .to_string_lossy()
+                .into_owned()
+        });
+        let entry = HostEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: h.alias.clone(),
+            host: h.host_name.unwrap_or(h.alias),
+            port: h.port.unwrap_or(22),
+            username: h.user.unwrap_or_default(),
+            auth_kind: if key_path.is_some() { "key" } else { "password" }.into(),
+            key_path,
+            passphrase: None,
+        };
+        match hosts.iter_mut().find(|e| e.name == entry.name) {
+            Some(existing) => {
+                let id = existing.id.clone();
+                *existing = HostEntry { id, ..entry };
+            }
+            None => hosts.push(entry),
+        }
+    }
+    persist_hosts(&app, &hosts)?;
+    Ok(hosts)
+}
+
+fn dirs_fallback_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt::init();
@@ -670,6 +750,7 @@ pub fn run() {
             list_hosts,
             save_host,
             delete_host,
+            import_ssh_config,
             resolve_hostkey,
             sftp_list,
             sftp_canonicalize,
@@ -680,6 +761,7 @@ pub fn run() {
             sftp_rename,
             forward_add_local,
             forward_add_remote,
+            forward_add_dynamic,
             forward_remove,
             forward_list,
         ])

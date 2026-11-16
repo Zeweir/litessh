@@ -42,6 +42,9 @@ struct Args {
     /// Repeatable.
     #[arg(long = "fwd-r")]
     fwd_remote: Vec<String>,
+    /// Dynamic SOCKS5 forward listen port (binds 127.0.0.1). Repeatable.
+    #[arg(long = "fwd-d")]
+    fwd_dynamic: Vec<u16>,
 }
 
 fn parse_fwd(spec: &str) -> Result<(u16, String, u16)> {
@@ -138,6 +141,13 @@ async fn main() -> Result<()> {
             forwarder.add_route(bound as u32, th, tp).await;
             eprintln!("[fwd-r] remote 127.0.0.1:{bound} ready");
         }
+    }
+
+    for lp in &args.fwd_dynamic {
+        let f = session
+            .start_socks5_forward("127.0.0.1".into(), *lp)
+            .await?;
+        eprintln!("[fwd-d] socks5 127.0.0.1:{} ready", f.bound_port);
     }
 
     session.write(args.cmd.as_bytes()).await?;
