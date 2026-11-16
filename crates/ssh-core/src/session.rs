@@ -262,60 +262,123 @@ pub struct SshSession {
     forwarded_rx: Mutex<Option<ForwardedRx>>,
 }
 
-impl SshSession {
-    pub async fn connect(
-        params: &ConnectParams,
-        events: mpsc::UnboundedSender<SessionEvent>,
-    ) -> anyhow::Result<Self> {
-        // No inactivity_timeout: interactive terminals stay open for hours idle.
-        let config = Arc::new(client::Config::default());
+/// SSH protocol handshake + authentication over a transport — TCP direct
+/// or a `direct-tcpip` channel through a jump host. `jump` enables
+/// ProxyJump chaining.
+async fn handshake(
+    params: &ConnectParams,
+    jump: Option<&JumpConnection>,
+) -> anyhow::Result<(Handle<ClientHandler>, ForwardedRx)> {
+    // Keepalive instead of inactivity_timeout: interactive terminals stay
+    // open for hours idle, but NATs get probed every 30s.
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(30)),
+        ..Default::default()
+    });
 
-        let connect_timeout = if params.hostkey_prompt_tx.is_some() {
-            params.connect_timeout + HOSTKEY_PROMPT_GRACE
-        } else {
-            params.connect_timeout
-        };
-        let (forwarded_tx, forwarded_rx) = mpsc::unbounded_channel();
-        let handler = ClientHandler {
-            host: params.host.clone(),
-            port: params.port,
-            known_hosts_path: params.known_hosts_path.clone(),
-            prompt_tx: params.hostkey_prompt_tx.clone(),
-            forwarded_tx,
-        };
-        let mut handle = tokio::time::timeout(
+    let connect_timeout = if params.hostkey_prompt_tx.is_some() {
+        params.connect_timeout + HOSTKEY_PROMPT_GRACE
+    } else {
+        params.connect_timeout
+    };
+    let (forwarded_tx, forwarded_rx) = mpsc::unbounded_channel();
+    let handler = ClientHandler {
+        host: params.host.clone(),
+        port: params.port,
+        known_hosts_path: params.known_hosts_path.clone(),
+        prompt_tx: params.hostkey_prompt_tx.clone(),
+        forwarded_tx,
+    };
+    // Open the jump channel outside the SSH-error context so its
+    // anyhow error isn't converted into russh::Error.
+    let handle = if let Some(j) = jump {
+        let ch = j.open_channel_to(&params.host, params.port).await?;
+        tokio::time::timeout(
+            connect_timeout,
+            client::connect_stream(config, ch.into_stream(), handler),
+        )
+        .await
+    } else {
+        tokio::time::timeout(
             connect_timeout,
             client::connect(config, (params.host.as_str(), params.port), handler),
         )
         .await
-        .context("connection timed out")?
-        .context("tcp/ssh handshake failed")?;
+    }
+    .context("connection timed out")?
+    .context("tcp/ssh handshake failed")?;
+    Ok((handle, forwarded_rx))
+}
 
-        match &params.auth {
-            AuthMethod::Password(password) => {
-                let res = handle
-                    .authenticate_password(&params.username, password)
-                    .await?;
-                if !res.success() {
-                    bail!("authentication failed");
-                }
-            }
-            AuthMethod::PrivateKey { path, passphrase } => {
-                let path = expand_tilde(path);
-                let key = load_secret_key(&path, passphrase.as_deref())
-                    .with_context(|| format!("loading key {}", path.display()))?;
-                let hash: Option<HashAlg> = handle.best_supported_rsa_hash().await?.flatten();
-                let res = handle
-                    .authenticate_publickey(
-                        &params.username,
-                        PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                    )
-                    .await?;
-                if !res.success() {
-                    bail!("authentication failed");
-                }
+async fn authenticate(
+    handle: &mut Handle<ClientHandler>,
+    params: &ConnectParams,
+) -> anyhow::Result<()> {
+    match &params.auth {
+        AuthMethod::Password(password) => {
+            let res = handle
+                .authenticate_password(&params.username, password)
+                .await?;
+            if !res.success() {
+                bail!("authentication failed");
             }
         }
+        AuthMethod::PrivateKey { path, passphrase } => {
+            let path = expand_tilde(path);
+            let key = load_secret_key(&path, passphrase.as_deref())
+                .with_context(|| format!("loading key {}", path.display()))?;
+            let hash: Option<HashAlg> = handle.best_supported_rsa_hash().await?.flatten();
+            let res = handle
+                .authenticate_publickey(
+                    &params.username,
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+                )
+                .await?;
+            if !res.success() {
+                bail!("authentication failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An authenticated SSH transport without a shell — a ProxyJump hop.
+/// Keep it alive as long as any session is tunneled through it.
+pub struct JumpConnection {
+    handle: Handle<ClientHandler>,
+}
+
+impl JumpConnection {
+    pub async fn connect(
+        params: &ConnectParams,
+        jump: Option<&JumpConnection>,
+    ) -> anyhow::Result<Self> {
+        let (mut handle, _forwarded_rx) = handshake(params, jump).await?;
+        authenticate(&mut handle, params).await?;
+        Ok(Self { handle })
+    }
+
+    /// Open a direct-tcpip channel to `host:port` through this hop.
+    pub async fn open_channel_to(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> anyhow::Result<Channel<client::Msg>> {
+        Ok(self
+            .handle
+            .channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", 0)
+            .await?)
+    }
+}
+
+impl SshSession {
+    pub async fn connect(
+        params: &ConnectParams,
+        events: mpsc::UnboundedSender<SessionEvent>,
+        jump: Option<&JumpConnection>,
+    ) -> anyhow::Result<Self> {
+        let (mut handle, forwarded_rx) = handshake(params, jump).await?;
+        authenticate(&mut handle, params).await?;
 
         let channel = handle.channel_open_session().await?;
         channel

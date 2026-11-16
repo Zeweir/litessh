@@ -8,7 +8,8 @@ use std::{
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
 use ssh_core::{
-    AuthMethod, ConnectParams, HostKeyPrompt, RemoteForwarder, SessionEvent, SshSession,
+    AuthMethod, ConnectParams, HostKeyPrompt, JumpConnection, RemoteForwarder, SessionEvent,
+    SshSession,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
@@ -23,6 +24,8 @@ pub struct AppState {
     forwards: Arc<Mutex<HashMap<String, ActiveForward>>>,
     /// session_id -> -R demux (lazily started)
     remote_forwarders: Arc<Mutex<HashMap<String, Arc<RemoteForwarder>>>>,
+    /// session_id -> jump-host transport kept alive for that session
+    jumps: Mutex<HashMap<String, Arc<JumpConnection>>>,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +41,33 @@ pub struct ConnectRequest {
     pub cols: u32,
     #[serde(default = "default_rows")]
     pub rows: u32,
+    /// ProxyJump hop: connect through this server first.
+    pub jump: Option<JumpRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JumpRequest {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: Option<String>,
+    pub key_path: Option<String>,
+    pub passphrase: Option<String>,
+}
+
+fn auth_of(
+    password: Option<String>,
+    key_path: Option<String>,
+    passphrase: Option<String>,
+) -> AuthMethod {
+    match key_path.filter(|s| !s.is_empty()) {
+        Some(key_path) => AuthMethod::PrivateKey {
+            path: key_path.into(),
+            passphrase: passphrase.filter(|s| !s.is_empty()),
+        },
+        None => AuthMethod::Password(password.unwrap_or_default()),
+    }
 }
 
 fn default_cols() -> u32 {
@@ -53,13 +83,7 @@ async fn connect(
     state: State<'_, AppState>,
     req: ConnectRequest,
 ) -> Result<String, String> {
-    let auth = match req.key_path.filter(|s| !s.is_empty()) {
-        Some(key_path) => AuthMethod::PrivateKey {
-            path: key_path.into(),
-            passphrase: req.passphrase.filter(|s| !s.is_empty()),
-        },
-        None => AuthMethod::Password(req.password.unwrap_or_default()),
-    };
+    let auth = auth_of(req.password, req.key_path, req.passphrase);
     // Host-key verification prompts -> `hostkey-verify` events, resolved
     // by the `resolve_hostkey` command.
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<HostKeyPrompt>();
@@ -87,6 +111,27 @@ async fn connect(
         }
     });
 
+    // ProxyJump hop first: host-key prompts reuse the same channel, so the
+    // user verifies the bastion's key in the same modal flow.
+    let jump = if let Some(j) = &req.jump {
+        let jparams = ConnectParams {
+            host: j.host.clone(),
+            port: j.port,
+            username: j.username.clone(),
+            auth: auth_of(j.password.clone(), j.key_path.clone(), j.passphrase.clone()),
+            known_hosts_path: known_hosts_path(&app).ok(),
+            hostkey_prompt_tx: Some(prompt_tx.clone()),
+            ..Default::default()
+        };
+        Some(Arc::new(
+            JumpConnection::connect(&jparams, None)
+                .await
+                .map_err(|e| format!("jump host {}: {e:#}", j.host))?,
+        ))
+    } else {
+        None
+    };
+
     let params = ConnectParams {
         host: req.host,
         port: req.port,
@@ -100,7 +145,7 @@ async fn connect(
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let session = SshSession::connect(&params, tx)
+    let session = SshSession::connect(&params, tx, jump.as_deref())
         .await
         .map_err(|e| format!("{e:#}"))?;
 
@@ -110,6 +155,13 @@ async fn connect(
         .lock()
         .map_err(|_| "state poisoned")?
         .insert(id.clone(), Arc::new(session));
+    if let Some(j) = jump {
+        state
+            .jumps
+            .lock()
+            .map_err(|_| "state poisoned")?
+            .insert(id.clone(), j);
+    }
 
     let id2 = id.clone();
     tauri::async_runtime::spawn(async move {
@@ -192,6 +244,9 @@ async fn resize(
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
     if let Ok(mut map) = state.sftps.lock() {
+        map.remove(&session_id);
+    }
+    if let Ok(mut map) = state.jumps.lock() {
         map.remove(&session_id);
     }
     remove_session_forwards(&state, &session_id);
@@ -617,6 +672,9 @@ pub struct HostEntry {
     /// The secret itself is never written to hosts.json.
     #[serde(default)]
     pub password_saved: bool,
+    /// Id of another saved host used as the ProxyJump hop.
+    #[serde(default)]
+    pub jump_host_id: Option<String>,
 }
 
 fn hosts_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -736,7 +794,7 @@ fn import_ssh_config(app: AppHandle, path: Option<String>) -> Result<Vec<HostEnt
     };
     let parsed = ssh_core::read_ssh_config(&cfg_path).map_err(|e| e.to_string())?;
     let mut hosts = list_hosts(app.clone())?;
-    for h in parsed {
+    for h in parsed.iter().cloned() {
         let key_path = h.identity_file.map(|p| {
             ssh_core::expand_tilde(&PathBuf::from(&p))
                 .to_string_lossy()
@@ -757,6 +815,7 @@ fn import_ssh_config(app: AppHandle, path: Option<String>) -> Result<Vec<HostEnt
             key_path,
             passphrase: None,
             password_saved: false,
+            jump_host_id: None,
         };
         match hosts.iter_mut().find(|e| e.name == entry.name) {
             Some(existing) => {
@@ -765,6 +824,32 @@ fn import_ssh_config(app: AppHandle, path: Option<String>) -> Result<Vec<HostEnt
             }
             None => hosts.push(entry),
         }
+    }
+    // Second pass: resolve ProxyJump aliases to saved host ids. A jump
+    // value like "user@bastion:22" matches host names "bastion" or
+    // "user@bastion:22" verbatim first.
+    for h in parsed.iter().filter(|h| h.proxy_jump.is_some()) {
+        let jump_raw = h.proxy_jump.clone().unwrap();
+        // first comma-separated hop only
+        let first = jump_raw.split(',').next().unwrap_or("").trim().to_string();
+        let host_part = first
+            .rsplit('@')
+            .next()
+            .unwrap_or(&first)
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let Some(idx) = hosts.iter().position(|e| e.name == h.alias) else {
+            continue;
+        };
+        let own = hosts[idx].id.clone();
+        hosts[idx].jump_host_id = hosts
+            .iter()
+            .find(|e| {
+                e.id != own && (e.name == first || e.name == host_part || e.host == host_part)
+            })
+            .map(|e| e.id.clone());
     }
     persist_hosts(&app, &hosts)?;
     Ok(hosts)
@@ -851,6 +936,7 @@ pub fn run() {
             verifications: Arc::new(Mutex::new(HashMap::new())),
             forwards: Arc::new(Mutex::new(HashMap::new())),
             remote_forwarders: Arc::new(Mutex::new(HashMap::new())),
+            jumps: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             connect,

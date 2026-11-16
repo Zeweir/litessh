@@ -14,6 +14,8 @@ pub struct SshConfigHost {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<String>,
+    /// Raw `ProxyJump` value (alias or user@host:port); `none` is skipped.
+    pub proxy_jump: Option<String>,
 }
 
 /// Parse the config text into concrete host entries, first alias per
@@ -54,6 +56,7 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshConfigHost> {
                     user: None,
                     port: None,
                     identity_file: None,
+                    proxy_jump: None,
                 });
             }
             "match" => {
@@ -72,6 +75,12 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshConfigHost> {
                     "user" => h.user = Some(unquote(value)),
                     "port" => h.port = value.parse().ok(),
                     "identityfile" => h.identity_file = Some(unquote(value)),
+                    "proxyjump" => {
+                        let v = unquote(value);
+                        if !v.eq_ignore_ascii_case("none") {
+                            h.proxy_jump = Some(v);
+                        }
+                    }
                     _ => {}
                 }
             }

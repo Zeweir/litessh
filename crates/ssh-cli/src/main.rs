@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let session = Arc::new(SshSession::connect(&params, tx).await?);
+    let session = Arc::new(SshSession::connect(&params, tx, None).await?);
     eprintln!("[connected]");
 
     if let Some(dir) = args.sftp_ls {
