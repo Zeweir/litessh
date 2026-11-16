@@ -12,6 +12,7 @@
 - SFTP 文件面板（标签页 ⇄ 按钮）：远程目录浏览、上传/下载、新建目录、删除
 - 端口转发面板（标签页 ⇒ 按钮）：本地 -L、远程 -R、动态 -D（SOCKS5）转发，随会话断开自动清理
 - `~/.ssh/config` 一键导入（侧栏 ⇊ 按钮，Host/HostName/User/Port/IdentityFile）
+- 命令片段库（侧栏底部 Snippets）：保存常用命令，点击一键发送到当前终端
 
 ## 结构
 
@@ -52,5 +53,5 @@ CI 已配置（`.github/workflows/build.yml`）：Windows runner 上自动构建
 - [x] 本地 -L / 远程 -R / 动态 -D（SOCKS5）端口转发
 - [x] known_hosts 主机密钥校验（TOFU）
 - [x] 读取 `~/.ssh/config` 导入主机
-- [ ] 命令片段库
+- [x] 命令片段库
 - [ ] Windows 凭据管理器存密码

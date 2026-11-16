@@ -5,7 +5,7 @@ use bytes::Bytes;
 use russh::{
     client::{self, Handle, Handler},
     keys::{
-        load_secret_key, known_hosts, HashAlg, PrivateKeyWithHashAlg, PublicKey,
+        known_hosts, load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKey,
         PublicKeyOrCertificate,
     },
     Channel, ChannelMsg, ChannelOpenFailure, ChannelWriteHalf,
@@ -75,6 +75,11 @@ pub struct HostKeyPrompt {
 }
 
 pub type HostKeyPromptTx = mpsc::UnboundedSender<HostKeyPrompt>;
+/// Channel handed to the client by the server for a `forwarded-tcpip` open,
+/// tagged with the remote port it was connected to.
+type ForwardedChannel = (Channel<client::Msg>, u32);
+type ForwardedTx = mpsc::UnboundedSender<ForwardedChannel>;
+type ForwardedRx = mpsc::UnboundedReceiver<ForwardedChannel>;
 
 /// How long `check_server_key` waits for a user decision.
 const HOSTKEY_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -108,7 +113,7 @@ struct ClientHandler {
     known_hosts_path: Option<PathBuf>,
     prompt_tx: Option<HostKeyPromptTx>,
     /// Channels the server opens for remote (-R) forwards.
-    forwarded_tx: mpsc::UnboundedSender<(Channel<client::Msg>, u32)>,
+    forwarded_tx: ForwardedTx,
 }
 
 /// Remove every stored host-key line matching `host`/`[host]:port`.
@@ -130,9 +135,7 @@ fn remove_host_key_lines(path: &Path, host: &str, port: u16) -> std::io::Result<
             if hosts_field.starts_with('@') {
                 hosts_field = fields.next().unwrap_or("");
             }
-            !hosts_field
-                .split(',')
-                .any(|h| h == host || h == bracketed)
+            !hosts_field.split(',').any(|h| h == host || h == bracketed)
         })
         .collect();
     let mut out = kept.join("\n");
@@ -161,14 +164,13 @@ impl Handler for ClientHandler {
             return Ok(true);
         };
 
-        let changed = match known_hosts::check_known_hosts_path(
-            &self.host, self.port, &pubkey, path,
-        ) {
-            Ok(true) => return Ok(true),
-            Ok(false) => false,
-            Err(russh::keys::Error::KeyChanged { .. }) => true,
-            Err(_) => false, // unreadable/missing file -> treat as unknown host
-        };
+        let changed =
+            match known_hosts::check_known_hosts_path(&self.host, self.port, &pubkey, path) {
+                Ok(true) => return Ok(true),
+                Ok(false) => false,
+                Err(russh::keys::Error::KeyChanged { .. }) => true,
+                Err(_) => false, // unreadable/missing file -> treat as unknown host
+            };
 
         let Some(tx) = &self.prompt_tx else {
             // Non-interactive: never silently trust.
@@ -198,9 +200,7 @@ impl Handler for ClientHandler {
         if changed {
             let _ = remove_host_key_lines(path, &self.host, self.port);
         }
-        if let Err(e) = known_hosts::learn_known_hosts_path(
-            &self.host, self.port, &pubkey, path,
-        ) {
+        if let Err(e) = known_hosts::learn_known_hosts_path(&self.host, self.port, &pubkey, path) {
             tracing::warn!("failed to record host key: {e}");
         }
         Ok(true)
@@ -259,7 +259,7 @@ pub struct SshSession {
     write_half: ChannelWriteHalf<client::Msg>,
     handle: Handle<ClientHandler>,
     /// Taken by `start_remote_forwarder` (one per session).
-    forwarded_rx: Mutex<Option<mpsc::UnboundedReceiver<(Channel<client::Msg>, u32)>>>,
+    forwarded_rx: Mutex<Option<ForwardedRx>>,
 }
 
 impl SshSession {
@@ -267,9 +267,8 @@ impl SshSession {
         params: &ConnectParams,
         events: mpsc::UnboundedSender<SessionEvent>,
     ) -> anyhow::Result<Self> {
-        let mut config = client::Config::default();
-        config.inactivity_timeout = Some(Duration::from_secs(30));
-        let config = Arc::new(config);
+        // No inactivity_timeout: interactive terminals stay open for hours idle.
+        let config = Arc::new(client::Config::default());
 
         let connect_timeout = if params.hostkey_prompt_tx.is_some() {
             params.connect_timeout + HOSTKEY_PROMPT_GRACE
@@ -388,10 +387,8 @@ impl SshSession {
                             {
                                 Ok(channel) => {
                                     let mut stream = channel.into_stream();
-                                    let _ = tokio::io::copy_bidirectional(
-                                        &mut tcp, &mut stream,
-                                    )
-                                    .await;
+                                    let _ =
+                                        tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
                                 }
                                 Err(e) => {
                                     tracing::warn!("direct-tcpip to {dest} failed: {e}");
@@ -452,8 +449,7 @@ impl SshSession {
             .await
             .take()
             .context("remote forwarder already started")?;
-        let routes: Arc<Mutex<std::collections::HashMap<u32, (String, u16)>>> =
-            Default::default();
+        let routes: Arc<Mutex<std::collections::HashMap<u32, (String, u16)>>> = Default::default();
         let routes2 = Arc::clone(&routes);
         let demux = tokio::spawn(async move {
             let mut rx = rx;
@@ -474,7 +470,10 @@ impl SshSession {
                 });
             }
         });
-        Ok(RemoteForwarder { routes, _demux: demux })
+        Ok(RemoteForwarder {
+            routes,
+            _demux: demux,
+        })
     }
 
     /// Ask the server to listen on `addr:port` (remote -R side).
@@ -526,10 +525,7 @@ impl SshSession {
 
 /// Minimal SOCKS5 (RFC 1928) no-auth CONNECT handshake, then bidirectional
 /// piping into a direct-tcpip channel.
-async fn handle_socks5_conn(
-    mut tcp: TcpStream,
-    session: &Arc<SshSession>,
-) -> anyhow::Result<()> {
+async fn handle_socks5_conn(mut tcp: TcpStream, session: &Arc<SshSession>) -> anyhow::Result<()> {
     // --- greeting: VER, NMETHODS, METHODS ---
     let mut head = [0u8; 2];
     tcp.read_exact(&mut head).await?;
@@ -582,12 +578,7 @@ async fn handle_socks5_conn(
 
     let channel = match session
         .handle
-        .channel_open_direct_tcpip(
-            host.clone(),
-            port as u32,
-            "127.0.0.1",
-            0,
-        )
+        .channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", 0)
         .await
     {
         Ok(c) => c,

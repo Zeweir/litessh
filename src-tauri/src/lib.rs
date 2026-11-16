@@ -730,6 +730,69 @@ fn dirs_fallback_home() -> PathBuf {
         .unwrap_or_default()
 }
 
+// --- command snippets ---
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Snippet {
+    pub id: String,
+    pub name: String,
+    /// Sent verbatim to the terminal; `\n` submits.
+    pub command: String,
+}
+
+fn snippets_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_config_dir()
+        .map_err(|e| e.to_string())?
+        .join("snippets.json"))
+}
+
+#[tauri::command]
+fn list_snippets(app: AppHandle) -> Result<Vec<Snippet>, String> {
+    let path = snippets_path(&app)?;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+fn persist_snippets(app: &AppHandle, items: &[Snippet]) -> Result<(), String> {
+    let path = snippets_path(app)?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(items).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_snippet(app: AppHandle, mut snippet: Snippet) -> Result<Vec<Snippet>, String> {
+    let mut items = list_snippets(app.clone())?;
+    if snippet.id.is_empty() {
+        snippet.id = uuid::Uuid::new_v4().to_string();
+    }
+    match items.iter_mut().find(|s| s.id == snippet.id) {
+        Some(existing) => *existing = snippet,
+        None => items.push(snippet),
+    }
+    persist_snippets(&app, &items)?;
+    Ok(items)
+}
+
+#[tauri::command]
+fn delete_snippet(app: AppHandle, snippet_id: String) -> Result<Vec<Snippet>, String> {
+    let mut items = list_snippets(app.clone())?;
+    items.retain(|s| s.id != snippet_id);
+    persist_snippets(&app, &items)?;
+    Ok(items)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt::init();
@@ -751,6 +814,9 @@ pub fn run() {
             save_host,
             delete_host,
             import_ssh_config,
+            list_snippets,
+            save_snippet,
+            delete_snippet,
             resolve_hostkey,
             sftp_list,
             sftp_canonicalize,

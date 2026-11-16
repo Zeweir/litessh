@@ -69,8 +69,7 @@ async fn main() -> Result<()> {
         AuthMethod::Password(args.password.unwrap_or_default())
     };
 
-    let (prompt_tx, mut prompt_rx) =
-        mpsc::unbounded_channel::<ssh_core::HostKeyPrompt>();
+    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<ssh_core::HostKeyPrompt>();
     let auto_accept = args.yes;
     tokio::spawn(async move {
         while let Some(prompt) = prompt_rx.recv().await {

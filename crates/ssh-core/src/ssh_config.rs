@@ -82,10 +82,7 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshConfigHost> {
     }
     // drop entries with no connection info at all
     out.retain(|h| {
-        h.host_name.is_some()
-            || h.user.is_some()
-            || h.port.is_some()
-            || h.identity_file.is_some()
+        h.host_name.is_some() || h.user.is_some() || h.port.is_some() || h.identity_file.is_some()
     });
     out
 }

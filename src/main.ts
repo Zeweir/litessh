@@ -30,6 +30,12 @@ interface SessionTab {
   fwdPanel?: HTMLDivElement;
 }
 
+interface Snippet {
+  id: string;
+  name: string;
+  command: string;
+}
+
 interface SftpEntry {
   name: string;
   path: string;
@@ -40,6 +46,7 @@ interface SftpEntry {
 }
 
 let hosts: HostEntry[] = [];
+let snippets: Snippet[] = [];
 let tabs: SessionTab[] = [];
 let activeTab: SessionTab | null = null;
 let editingHostId: string | null = null;
@@ -690,6 +697,53 @@ function wireSessionEvents(tab: SessionTab) {
   void p.then((uns) => tab.unlisteners.push(...uns));
 }
 
+// --- command snippets ---
+
+function renderSnippets() {
+  const list = $("#snippet-list");
+  list.innerHTML = "";
+  for (const s of snippets) {
+    const item = document.createElement("div");
+    item.className = "host-item snippet-item";
+    item.innerHTML = `
+      <div class="info">
+        <div class="name"></div>
+        <div class="addr mono"></div>
+      </div>
+      <div class="actions">
+        <button data-act="del" title="Delete">✕</button>
+      </div>`;
+    item.querySelector(".name")!.textContent = s.name;
+    item.querySelector(".addr")!.textContent = s.command;
+    item.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).dataset.act === "del") {
+        void invoke<Snippet[]>("delete_snippet", { snippetId: s.id }).then((v) => {
+          snippets = v;
+          renderSnippets();
+        });
+      } else {
+        sendSnippet(s);
+      }
+    });
+    list.appendChild(item);
+  }
+}
+
+function sendSnippet(s: Snippet) {
+  if (!activeTab?.sessionId || activeTab.dead) return;
+  const text = s.command.endsWith("\n") ? s.command : s.command + "\n";
+  void invoke("write_input", {
+    sessionId: activeTab.sessionId,
+    data: Array.from(encoder.encode(text)),
+  });
+  activeTab.term.focus();
+}
+
+async function refreshSnippets() {
+  snippets = await invoke<Snippet[]>("list_snippets");
+  renderSnippets();
+}
+
 // --- wire up UI ---
 
 $("#btn-new-host").addEventListener("click", () => openHostModal());
@@ -706,6 +760,24 @@ $("#btn-import-config").addEventListener("click", async () => {
   }
 });
 $("#btn-cancel-host").addEventListener("click", closeHostModal);
+
+$("#btn-new-snippet").addEventListener("click", () => {
+  $("#snippet-form").classList.toggle("hidden");
+  ($("#snippet-name") as HTMLInputElement).focus();
+});
+
+$("#btn-save-snippet").addEventListener("click", async () => {
+  const name = ($("#snippet-name") as HTMLInputElement).value.trim();
+  const command = ($("#snippet-command") as HTMLInputElement).value;
+  if (!name || !command) return;
+  snippets = await invoke<Snippet[]>("save_snippet", {
+    snippet: { id: "", name, command },
+  });
+  renderSnippets();
+  ($("#snippet-name") as HTMLInputElement).value = "";
+  ($("#snippet-command") as HTMLInputElement).value = "";
+  $("#snippet-form").classList.add("hidden");
+});
 
 ($("#host-form") as HTMLFormElement).addEventListener("submit", (e) => {
   e.preventDefault();
@@ -756,3 +828,4 @@ async function deleteHost(id: string) {
 }
 
 void refreshHosts();
+void refreshSnippets();
