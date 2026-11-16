@@ -150,7 +150,9 @@ fn resolve_hostkey(
         .map_err(|_| "state poisoned")?
         .remove(&verify_id);
     match decision {
-        Some(tx) => tx.send(accept).map_err(|_| "connection already dropped".into()),
+        Some(tx) => tx
+            .send(accept)
+            .map_err(|_| "connection already dropped".into()),
         None => Err("no pending verification".into()),
     }
 }
@@ -235,12 +237,7 @@ async fn get_sftp(
         sessions.get(session_id).cloned()
     }
     .ok_or("no such session")?;
-    let sftp = Arc::new(
-        session
-            .open_sftp()
-            .await
-            .map_err(|e| format!("{e:#}"))?,
-    );
+    let sftp = Arc::new(session.open_sftp().await.map_err(|e| format!("{e:#}"))?);
     state
         .sftps
         .lock()
@@ -256,10 +253,7 @@ async fn sftp_list(
     path: String,
 ) -> Result<Vec<SftpEntry>, String> {
     let sftp = get_sftp(&state, &session_id).await?;
-    let dir = sftp
-        .read_dir(path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let dir = sftp.read_dir(path).await.map_err(|e| e.to_string())?;
     Ok(dir
         .map(|e| {
             let meta = e.metadata();
@@ -356,7 +350,9 @@ async fn sftp_rename(
     new_path: String,
 ) -> Result<(), String> {
     let sftp = get_sftp(&state, &session_id).await?;
-    sftp.rename(old_path, new_path).await.map_err(|e| e.to_string())
+    sftp.rename(old_path, new_path)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // --- port forwarding ---
@@ -537,10 +533,7 @@ async fn forward_add_dynamic(
 }
 
 #[tauri::command]
-async fn forward_remove(
-    state: State<'_, AppState>,
-    forward_id: String,
-) -> Result<(), String> {
+async fn forward_remove(state: State<'_, AppState>, forward_id: String) -> Result<(), String> {
     let fwd = state
         .forwards
         .lock()
@@ -619,6 +612,11 @@ pub struct HostEntry {
     pub key_path: Option<String>,
     #[serde(default)]
     pub passphrase: Option<String>,
+    /// True when the password lives in the OS credential store
+    /// (Windows Credential Manager / Keychain / Secret Service).
+    /// The secret itself is never written to hosts.json.
+    #[serde(default)]
+    pub password_saved: bool,
 }
 
 fn hosts_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -677,18 +675,61 @@ fn save_host(app: AppHandle, mut host: HostEntry) -> Result<Vec<HostEntry>, Stri
 fn delete_host(app: AppHandle, host_id: String) -> Result<Vec<HostEntry>, String> {
     let mut hosts = list_hosts(app.clone())?;
     hosts.retain(|h| h.id != host_id);
+    let _ = delete_host_password(&host_id);
     persist_hosts(&app, &hosts)?;
     Ok(hosts)
+}
+
+// --- OS credential store (keyring) ---
+
+fn host_credential(host_id: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("litessh", host_id).map_err(|e| e.to_string())
+}
+
+fn set_password_saved_flag(app: &AppHandle, host_id: &str, saved: bool) -> Result<(), String> {
+    let mut hosts = list_hosts(app.clone())?;
+    if let Some(h) = hosts.iter_mut().find(|h| h.id == host_id) {
+        h.password_saved = saved;
+        persist_hosts(app, &hosts)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_host_password(app: AppHandle, host_id: String, password: String) -> Result<(), String> {
+    host_credential(&host_id)?
+        .set_password(&password)
+        .map_err(|e| format!("credential store: {e}"))?;
+    set_password_saved_flag(&app, &host_id, true)
+}
+
+#[tauri::command]
+fn get_host_password(host_id: String) -> Result<Option<String>, String> {
+    match host_credential(&host_id)?.get_password() {
+        Ok(p) => Ok(Some(p)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("credential store: {e}")),
+    }
+}
+
+fn delete_host_password(host_id: &str) -> Result<(), String> {
+    match host_credential(host_id)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("credential store: {e}")),
+    }
+}
+
+#[tauri::command]
+fn clear_host_password(app: AppHandle, host_id: String) -> Result<(), String> {
+    delete_host_password(&host_id)?;
+    set_password_saved_flag(&app, &host_id, false)
 }
 
 /// Parse `path` (default `~/.ssh/config`) and merge concrete Host blocks
 /// into the saved list. Existing entries whose name matches an alias are
 /// replaced; returns the new list.
 #[tauri::command]
-fn import_ssh_config(
-    app: AppHandle,
-    path: Option<String>,
-) -> Result<Vec<HostEntry>, String> {
+fn import_ssh_config(app: AppHandle, path: Option<String>) -> Result<Vec<HostEntry>, String> {
     let cfg_path = match path.filter(|s| !s.is_empty()) {
         Some(p) => ssh_core::expand_tilde(&PathBuf::from(p)),
         None => dirs_fallback_home().join(".ssh").join("config"),
@@ -707,9 +748,15 @@ fn import_ssh_config(
             host: h.host_name.unwrap_or(h.alias),
             port: h.port.unwrap_or(22),
             username: h.user.unwrap_or_default(),
-            auth_kind: if key_path.is_some() { "key" } else { "password" }.into(),
+            auth_kind: if key_path.is_some() {
+                "key"
+            } else {
+                "password"
+            }
+            .into(),
             key_path,
             passphrase: None,
+            password_saved: false,
         };
         match hosts.iter_mut().find(|e| e.name == entry.name) {
             Some(existing) => {
@@ -813,6 +860,9 @@ pub fn run() {
             list_hosts,
             save_host,
             delete_host,
+            save_host_password,
+            get_host_password,
+            clear_host_password,
             import_ssh_config,
             list_snippets,
             save_snippet,

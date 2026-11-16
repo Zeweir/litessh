@@ -56,7 +56,8 @@
           </span>
         </label>
         <label class="key-only">Passphrase <input name="passphrase" type="password" /></label>
-        <p class="hint">Passwords are never saved — you will be asked on connect.</p>
+        <p class="hint" id="saved-pw-hint">Passwords are never saved to disk — the app asks on connect, and can remember them in the OS credential store.</p>
+        <button type="button" id="btn-forget-pw" class="hidden">忘记已保存的密码</button>
         <div class="modal-actions">
           <button type="button" id="btn-cancel-host">Cancel</button>
           <button type="submit" class="primary">Save</button>
@@ -89,6 +90,9 @@
       <form id="password-form" class="modal">
         <h2 id="password-title">Password</h2>
         <input name="password" type="password" required autocomplete="off" />
+        <label class="checkbox-row">
+          <input name="remember" type="checkbox" /> 记住密码（存入系统凭据管理器）
+        </label>
         <div class="modal-actions">
           <button type="button" id="btn-cancel-password">Cancel</button>
           <button type="submit" class="primary">Connect</button>

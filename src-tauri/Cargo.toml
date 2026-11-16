@@ -25,6 +25,8 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
+# OS credential store: Windows Credential Manager / macOS Keychain / Secret Service
+keyring = { version = "3", default-features = false, features = ["windows-native", "apple-native", "sync-secret-service"] }
 
 [workspace]
 # standalone package, outside the root workspace (root members = crates/*)

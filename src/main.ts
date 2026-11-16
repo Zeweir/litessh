@@ -5,6 +5,11 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 
+interface PasswordAnswer {
+  password: string;
+  remember: boolean;
+}
+
 interface HostEntry {
   id: string;
   name: string;
@@ -12,6 +17,7 @@ interface HostEntry {
   port: number;
   username: string;
   authKind: "password" | "key";
+  passwordSaved?: boolean;
   keyPath?: string;
   passphrase?: string;
 }
@@ -50,7 +56,7 @@ let snippets: Snippet[] = [];
 let tabs: SessionTab[] = [];
 let activeTab: SessionTab | null = null;
 let editingHostId: string | null = null;
-let passwordResolve: ((v: string | null) => void) | null = null;
+let passwordResolve: ((v: PasswordAnswer | null) => void) | null = null;
 const hostkeyQueue: HostKeyVerify[] = [];
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
@@ -104,6 +110,7 @@ function openHostModal(existing?: HostEntry) {
   (form.elements.namedItem("keyPath") as HTMLInputElement).value = existing?.keyPath ?? "";
   (form.elements.namedItem("passphrase") as HTMLInputElement).value = existing?.passphrase ?? "";
   form.dataset.auth = ((form as HTMLFormElement).elements.namedItem("authKind") as HTMLSelectElement).value;
+  $("#btn-forget-pw").classList.toggle("hidden", !existing?.passwordSaved);
   $("#host-modal").classList.remove("hidden");
 }
 
@@ -113,7 +120,7 @@ function closeHostModal() {
 
 // --- password prompt ---
 
-function askPassword(label: string): Promise<string | null> {
+function askPassword(label: string): Promise<PasswordAnswer | null> {
   $("#password-title").textContent = label;
   ( $("#password-form") as HTMLFormElement ).reset();
   $("#password-modal").classList.remove("hidden");
@@ -123,7 +130,7 @@ function askPassword(label: string): Promise<string | null> {
   });
 }
 
-function closePasswordModal(result: string | null) {
+function closePasswordModal(result: PasswordAnswer | null) {
   $("#password-modal").classList.add("hidden");
   passwordResolve?.(result);
   passwordResolve = null;
@@ -176,10 +183,19 @@ void listen<HostKeyVerify>("hostkey-verify", (ev) => {
 
 async function connectToHost(h: HostEntry) {
   let password: string | undefined;
+  let remember = false;
   if (h.authKind === "password") {
-    const p = await askPassword(`Password for ${h.username}@${h.host}`);
-    if (p === null) return;
-    password = p;
+    if (h.passwordSaved) {
+      password =
+        (await invoke<string | null>("get_host_password", { hostId: h.id })) ??
+        undefined;
+    }
+    if (password === undefined) {
+      const p = await askPassword(`Password for ${h.username}@${h.host}`);
+      if (p === null) return;
+      password = p.password;
+      remember = p.remember;
+    }
   }
   const title = h.name || `${h.username}@${h.host}`;
   const tab = createTab(title);
@@ -201,6 +217,16 @@ async function connectToHost(h: HostEntry) {
     tab.sessionId = sessionId;
     wireSessionEvents(tab);
     setStatus(tab, "");
+    if (remember && password) {
+      try {
+        await invoke("save_host_password", { hostId: h.id, password });
+        h.passwordSaved = true;
+      } catch {
+        tab.term.write(
+          "\r\n\x1b[33m[could not save password to credential store]\x1b[0m\r\n",
+        );
+      }
+    }
   } catch (e) {
     tab.term.write(`\r\n\x1b[31m${String(e)}\x1b[0m\r\n`);
     markDead(tab);
@@ -789,6 +815,7 @@ $("#btn-save-snippet").addEventListener("click", async () => {
     port: Number((form.elements.namedItem("port") as HTMLInputElement).value) || 22,
     username: (form.elements.namedItem("username") as HTMLInputElement).value.trim(),
     authKind: (form.elements.namedItem("authKind") as HTMLSelectElement).value as "password" | "key",
+    passwordSaved: hosts.find((h) => h.id === editingHostId)?.passwordSaved ?? false,
     keyPath: (form.elements.namedItem("keyPath") as HTMLInputElement).value.trim() || undefined,
     passphrase: (form.elements.namedItem("passphrase") as HTMLInputElement).value || undefined,
   };
@@ -806,6 +833,15 @@ $("#btn-save-snippet").addEventListener("click", async () => {
   },
 );
 
+$("#btn-forget-pw").addEventListener("click", () => {
+  if (!editingHostId) return;
+  void invoke("clear_host_password", { hostId: editingHostId }).then(() => {
+    const h = hosts.find((x) => x.id === editingHostId);
+    if (h) h.passwordSaved = false;
+    $("#btn-forget-pw").classList.add("hidden");
+  });
+});
+
 $("#btn-browse-key").addEventListener("click", () => {
   void open({ multiple: false, directory: false }).then((path) => {
     if (typeof path === "string") {
@@ -817,8 +853,11 @@ $("#btn-browse-key").addEventListener("click", () => {
 
 ($("#password-form") as HTMLFormElement).addEventListener("submit", (e) => {
   e.preventDefault();
-  const pw = ((e.target as HTMLFormElement).elements.namedItem("password") as HTMLInputElement).value;
-  closePasswordModal(pw);
+  const els = (e.target as HTMLFormElement).elements;
+  closePasswordModal({
+    password: (els.namedItem("password") as HTMLInputElement).value,
+    remember: (els.namedItem("remember") as HTMLInputElement).checked,
+  });
 });
 $("#btn-cancel-password").addEventListener("click", () => closePasswordModal(null));
 
